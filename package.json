@@ -1,0 +1,40 @@
+{
+    "name": "mcp-broker",
+    "version": "1.0.0",
+    "description": "Lazy-loading MCP broker for Claude Code",
+    "type": "module",
+    "main": "dist/index.js",
+    "bin": {
+        "mcp-broker": "./dist/index.js"
+    },
+    "files": [
+        "dist",
+        "config"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/micaelmalta/mcp-broker.git"
+    },
+    "homepage": "https://github.com/micaelmalta/mcp-broker",
+    "bugs": {
+        "url": "https://github.com/micaelmalta/mcp-broker/issues"
+    },
+    "scripts": {
+        "build": "tsc",
+        "dev": "tsx src/index.ts",
+        "start": "node dist/index.js",
+        "migrate": "node scripts/migrate.mjs",
+        "revert-migration": "node scripts/revert-migration.mjs",
+        "benchmark": "node scripts/benchmark.mjs",
+        "prepublishOnly": "npm run build"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.0.0",
+        "zod": "^3.22.4"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.0.0",
+        "typescript": "^5.0.0"
+    }
+}

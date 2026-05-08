@@ -1,0 +1,38 @@
+{
+  "servers": {
+    "fetch-mcp": {
+      "description": "Web fetch, search, and HTTP tooling",
+      "keywords": ["web", "http", "fetch", "search", "url", "request", "html", "css", "json"],
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"],
+      "autoActivate": false
+    },
+    "github": {
+      "description": "GitHub repositories, issues, pull requests, and code search",
+      "keywords": ["github", "git", "repo", "issue", "pr", "pull request", "code", "commit"],
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "autoActivate": false
+    },
+    "filesystem": {
+      "description": "Read and write files on the local filesystem",
+      "keywords": ["file", "filesystem", "read", "write", "directory", "path", "disk"],
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "autoActivate": false
+    },
+    "postgres": {
+      "description": "PostgreSQL database queries and schema inspection",
+      "keywords": ["postgres", "postgresql", "database", "sql", "db", "query", "table"],
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {
+        "POSTGRES_CONNECTION_STRING": "${POSTGRES_CONNECTION_STRING}"
+      },
+      "autoActivate": false
+    }
+  }
+}
