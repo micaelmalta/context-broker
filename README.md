@@ -1,4 +1,4 @@
-# mcp-broker
+# context-broker
 
 > Lazy-loading MCP proxy for Claude Code. Instead of flooding the context window
 > with every tool schema on every request, the broker exposes **4 meta-tools** and
@@ -8,9 +8,9 @@
 Claude Code  ──────────────────────────────────────────────────────────
                discover_tools · activate_server · deactivate_server · list_active_servers
                                         │
-                              ┌─────────▼─────────┐
-                              │     mcp-broker     │
-                              └─────────┬─────────┘
+                              ┌──────────▼──────────┐
+                              │    context-broker    │
+                              └──────────┬──────────┘
                     ┌──────────┬────────┴────────┬──────────┐
                  spawned    spawned           spawned    spawned
                 on demand  on demand         on demand  on demand
@@ -18,7 +18,7 @@ Claude Code  ──────────────────────�
                  jira      github           postgres   fetch-mcp
 ```
 
-**96.6 % fewer input tokens** when idle. Servers load only when the task calls for them.
+**96.5% fewer input tokens** when idle. Servers load only when the task calls for them.
 
 ---
 
@@ -33,7 +33,7 @@ Add to `~/.claude/settings.json` (global) or `.claude/settings.json` (per-projec
   "mcpServers": {
     "broker": {
       "command": "npx",
-      "args": ["-y", "mcp-broker"]
+      "args": ["-y", "context-broker"]
     }
   }
 }
@@ -42,14 +42,14 @@ Add to `~/.claude/settings.json` (global) or `.claude/settings.json` (per-projec
 Pin a version:
 
 ```json
-"args": ["-y", "mcp-broker@1.0.0"]
+"args": ["-y", "context-broker@1.0.0"]
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/micaelmalta/mcp-broker.git
-cd mcp-broker
+git clone https://github.com/micaelmalta/context-broker.git
+cd context-broker
 npm install && npm run build
 ```
 
@@ -58,7 +58,7 @@ npm install && npm run build
   "mcpServers": {
     "broker": {
       "command": "node",
-      "args": ["/absolute/path/to/mcp-broker/dist/index.js"]
+      "args": ["/absolute/path/to/context-broker/dist/index.js"]
     }
   }
 }
@@ -68,35 +68,52 @@ npm install && npm run build
 
 ## Configure
 
-Create `~/.config/mcp-broker/servers.json`:
+### servers.json
+
+Create `~/.config/context-broker/servers.json`:
 
 ```bash
 # Via npx — pull the example config
-mkdir -p ~/.config/mcp-broker
-curl -fsSL https://raw.githubusercontent.com/micaelmalta/mcp-broker/main/config/servers.json \
-  > ~/.config/mcp-broker/servers.json
+mkdir -p ~/.config/context-broker
+curl -fsSL https://raw.githubusercontent.com/micaelmalta/context-broker/main/config/servers.json \
+  > ~/.config/context-broker/servers.json
 
 # From a local clone
-cp config/servers.json ~/.config/mcp-broker/servers.json
+cp config/servers.json ~/.config/context-broker/servers.json
 ```
 
 **Config resolution order:**
 1. `--config <path>` flag passed to the broker
-2. `~/.config/mcp-broker/servers.json`
+2. `~/.config/context-broker/servers.json`
 3. `./config/servers.json` (local clone fallback)
-
-### servers.json schema
 
 ```json
 {
   "servers": {
-    "my-server": {
+    "my-stdio-server": {
       "description": "One sentence — used by discover_tools to match queries",
       "keywords":    ["keyword1", "keyword2"],
       "command":     "npx",
       "args":        ["-y", "my-mcp-server"],
-      "env": {
-        "API_KEY": "${MY_API_KEY}"
+      "env":         { "API_KEY": "${MY_API_KEY}" },
+      "autoActivate": false
+    },
+    "my-http-server": {
+      "description": "Remote MCP server over HTTP with static auth",
+      "keywords":    ["keyword1", "keyword2"],
+      "type":        "http",
+      "url":         "https://my-mcp-server.example.com/mcp",
+      "headers":     { "Authorization": "Bearer ${MY_TOKEN}" },
+      "autoActivate": false
+    },
+    "slack": {
+      "description": "Slack — search messages, send communications, manage canvases",
+      "keywords":    ["slack", "message", "channel", "canvas"],
+      "type":        "http",
+      "url":         "https://mcp.slack.com/mcp",
+      "oauth": {
+        "clientId":    "xxx",
+        "callbackPort": 3118
       },
       "autoActivate": false
     }
@@ -106,6 +123,24 @@ cp config/servers.json ~/.config/mcp-broker/servers.json
 
 `${VAR}` references are resolved from the shell environment where Claude Code runs.
 
+### skills.json
+
+The broker also lazily loads **skills** — file-based instruction sets for Claude. Create `~/.config/context-broker/skills.json`:
+
+```json
+{
+  "skills": {
+    "my-skill": {
+      "description": "One sentence — used by discover_skill to match queries",
+      "keywords":    ["keyword1", "keyword2"],
+      "path":        "/path/to/skills/my-skill/SKILL.md"
+    }
+  }
+}
+```
+
+Skills are discovered via `discover_skill` and loaded on demand via `load_skill`, exposing two additional meta-tools alongside the four server meta-tools.
+
 ### autoActivate
 
 | Value | Behaviour |
@@ -114,13 +149,13 @@ cp config/servers.json ~/.config/mcp-broker/servers.json
 | `true` | Eager — spawned when the broker starts; tools immediately visible. |
 
 Use `true` for servers you reach every session (e.g. a filesystem or fetch server).
-Use `false` for heavy servers that run `docker build` or `npm install` on first launch — lazy keeps the idle cost low.
+Use `false` for heavy servers that run `docker build` or `npm install` on first launch.
 
 ---
 
 ## How it works
 
-Claude interacts exclusively through the 4 meta-tools:
+Claude interacts through 6 meta-tools — 4 for servers, 2 for skills:
 
 | Tool | What it does |
 |---|---|
@@ -128,6 +163,8 @@ Claude interacts exclusively through the 4 meta-tools:
 | `activate_server` | Spawns a server process, runs the MCP handshake, exposes its tools |
 | `deactivate_server` | Kills the server process and frees resources |
 | `list_active_servers` | Lists running servers and their loaded tools |
+| `discover_skill` | Scores all configured skills against a query; returns ranked matches |
+| `load_skill` | Reads and returns the full skill instructions on demand |
 
 ### Typical flow
 
@@ -144,7 +181,7 @@ Claude → search_issues(label: "bug")
        → ...
 ```
 
-When Claude calls a tool it hasn't activated yet, the broker attempts **auto-activation** — it scores all servers against the tool name and activates the best match. This is an escape hatch; the preferred path is explicit discover → activate.
+When Claude calls a tool it hasn't activated yet, the broker attempts **auto-activation** — it scores all servers against the tool name and activates the best match.
 
 ---
 
@@ -152,13 +189,20 @@ When Claude calls a tool it hasn't activated yet, the broker attempts **auto-act
 
 Measured with `claude -p` across **9 real MCP servers**, 2 rounds each:
 
-| Strategy | Input tokens | Saved | Cost / request |
-|---|---|---|---|
-| Direct — all schemas, every request | 30,044 | — | $0.1131 |
-| Broker idle — 0 servers active | 1,024 | **96.6 %** | $0.0031 |
-| Broker worst-case — all 9 active | 30,320 | ≈ 0 % | $0.1142 |
+```
+  Without broker   29,793 tokens of MCP schema injected per request
+  With broker         773 tokens              (96.5% less, −29,020 tokens/req)
+  Cost saving      $0.109 per request   ≈ $109.81 per 1,000 requests
+```
 
-The worst case — every server active simultaneously — costs the same as loading everything directly. Normal sessions activate 1–2 servers per task, so the real cost stays close to idle.
+| Strategy | Tokens | Cost / request | vs direct |
+|---|---|---|---|
+| baseline — no MCP at all | 283 | $0.00091 | — |
+| direct — all 9 servers upfront | 30,076 | $0.11324 | — |
+| **broker idle** — 4 meta-tools only | **1,056** | **$0.00342** | **−29,020** |
+| activated — broker + all 9 servers | 30,352 | $0.11427 | +276 |
+
+The worst case — every server active simultaneously — costs roughly the same as loading everything directly. Normal sessions activate 1–2 servers per task, so the real cost stays close to idle.
 
 Run the benchmark against your own config:
 
@@ -176,14 +220,14 @@ npm run benchmark -- --rounds 3
 
 ## Migration
 
-Import your existing MCP servers in one command:
+Import your existing MCP servers, skills, and plugin skills in one command:
 
 ```bash
+# From Claude Code  (~/.claude.json + ~/.claude/skills/ + ~/.claude/plugins/cache/)
+node scripts/migrate.mjs --from claude
+
 # From Cursor  (~/.cursor/mcp.json)
 node scripts/migrate.mjs --from cursor
-
-# From Claude Code  (~/.claude.json)
-node scripts/migrate.mjs --from claude
 
 # From OpenCode  (~/.config/opencode/opencode.json)
 node scripts/migrate.mjs --from opencode
@@ -192,38 +236,46 @@ node scripts/migrate.mjs --from opencode
 node scripts/migrate.mjs --from /path/to/mcp.json
 
 # Preview changes without writing
-node scripts/migrate.mjs --from cursor --dry-run
+node scripts/migrate.mjs --from claude --dry-run
 
-# Write to a custom path
-node scripts/migrate.mjs --from cursor --out /path/to/servers.json
+# Migrate only specific parts
+node scripts/migrate.mjs --from claude --servers
+node scripts/migrate.mjs --from claude --skills
+node scripts/migrate.mjs --from claude --plugins
 ```
 
-Or via npm: `npm run migrate -- --from cursor`
+Or via npm: `npm run migrate -- --from claude`
 
 **What the migration does:**
-- Converts `{ command, args, env }` entries to broker format with `description`, `keywords`, and `autoActivate: false`
-- Skips self-referential entries (broker/router) and HTTP/SSE servers (`url:`-based)
-- Merges with any existing `servers.json` — manually added entries are never overwritten
-- Infers keywords from the server name and command arguments
 
-> **Secrets** — values matching `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD`, and similar patterns are extracted to `~/.zshenv` and replaced with `${VAR}` references. Already-present vars are not duplicated.
+- **Servers** — converts `{ command, args, env }` entries to broker format with `description`, `keywords`, and `autoActivate: false`; skips self-referential entries and HTTP/SSE servers
+- **Skills** — moves `~/.claude/skills/` into `~/.config/context-broker/skills/`, registers them in `skills.json`, and leaves a symlink so slash commands (`/loi`, `/loi-generate`, etc.) keep working
+- **Plugins** — registers all plugin skills from `~/.claude/plugins/cache/` in `skills.json`; adds a `SessionStart` hook to keep registrations fresh after plugin updates
+- **Secrets** — values matching `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD` are extracted to `~/.zshenv` and replaced with `${VAR}` references; already-present vars are not duplicated
 
 ### Undo a migration
 
 ```bash
-# Remove all entries imported from Cursor + their secrets from ~/.zshenv
-node scripts/revert-migration.mjs --from cursor
+# Restore everything — servers back to ~/.claude.json, skills back to ~/.claude/skills/,
+# plugin SKILL.md files restored, SessionStart hook removed
+node scripts/revert-migration.mjs --from claude
 
 # Preview without writing
-node scripts/revert-migration.mjs --from cursor --dry-run
+node scripts/revert-migration.mjs --from claude --dry-run
 
-# Custom config path
-node scripts/revert-migration.mjs --from cursor --config /path/to/servers.json
+# Revert only specific parts
+node scripts/revert-migration.mjs --from claude --servers
+node scripts/revert-migration.mjs --from claude --skills
+node scripts/revert-migration.mjs --from claude --plugins
 ```
 
-Or via npm: `npm run revert-migration -- --from cursor`
+Or via npm: `npm run revert-migration -- --from claude`
 
-Only entries stamped `"Migrated from <source>"` are removed. Manually added entries are untouched.
+**What the revert does:**
+
+- **Servers** — writes all entries from `servers.json` back to the source config's `mcpServers`
+- **Skills** — merges `INSTRUCTIONS.md` back into `SKILL.md`, removes the symlink, and moves the skill directory back to `~/.claude/skills/`
+- **Plugins** — merges `INSTRUCTIONS.md` back into each plugin's `SKILL.md`, removes plugin entries from `skills.json`, and removes the `SessionStart` split-skills hook from `~/.claude/settings.json`
 
 ---
 

@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-// Benchmarks token usage and latency across three tool-loading strategies
+// Benchmarks token usage and latency across MCP tool-loading strategies
 // using the Claude CLI (`claude -p --output-format json`).
 //
 // Strategies:
-//   1. Direct       — all server schemas loaded upfront every request
-//   2. Broker idle  — only 4 broker meta-tools visible to Claude
-//   3. Broker worst — broker meta-tools + all servers activated (max overhead)
+//   baseline  — no MCP servers at all (pure system prompt cost)
+//   direct    — all servers loaded upfront every request (current worst case)
+//   broker    — only 4 meta-tools visible; servers loaded on demand
+//   activated — broker + all servers loaded (broker worst case)
 //
 // Usage:
 //   node scripts/benchmark.mjs
-//   node scripts/benchmark.mjs --config ~/.config/mcp-broker/servers.json
+//   node scripts/benchmark.mjs --config ~/.config/context-broker/servers.json
 //   node scripts/benchmark.mjs --servers fetch-mcp,jira
-//   node scripts/benchmark.mjs --rounds 3   (repeat each strategy N times, report mean)
+//   node scripts/benchmark.mjs --rounds 3
 
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -24,12 +25,12 @@ const execFileAsync = promisify(execFile);
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 
-const args = process.argv.slice(2);
-const get = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : null; };
+const args   = process.argv.slice(2);
+const get    = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : null; };
 
-const configArg = get("--config");
-const serverArg = get("--servers");
-const roundsArg = parseInt(get("--rounds") ?? "1", 10);
+const configArg  = get("--config");
+const serverArg  = get("--servers");
+const roundsArg  = parseInt(get("--rounds") ?? "1", 10);
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function resolveConfig() {
   if (configArg) return resolve(configArg);
-  const xdg = resolve(homedir(), ".config", "mcp-broker", "servers.json");
+  const xdg = resolve(homedir(), ".config", "context-broker", "servers.json");
   if (existsSync(xdg)) return xdg;
   return resolve(__dirname, "../config/servers.json");
 }
@@ -55,9 +56,7 @@ if (Object.keys(servers).length === 0) {
   process.exit(1);
 }
 
-// ─── Broker meta-tool definitions (static fake MCP server) ────────────────
-// We expose them as a fake MCP server using `node -e` that speaks JSON-RPC
-// and returns exactly these 4 tools.
+// ─── Broker meta-tool definitions ─────────────────────────────────────────
 
 const BROKER_META_TOOLS = [
   { name: "discover_tools",     description: "Find which tool servers are available and relevant for a task. Call this first when you need a capability you don't have yet.", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
@@ -66,10 +65,7 @@ const BROKER_META_TOOLS = [
   { name: "list_active_servers", description: "Show which servers are currently active and their tools.", inputSchema: { type: "object", properties: {} } },
 ];
 
-// Inline Node.js MCP server that serves a static tool list via JSON-RPC stdio.
-// Passed as: node -e "<script>" -- '<json>'
-// eslint-disable-next-line no-unused-vars
-function makeFakeMcpScript(_tools) {
+function makeFakeMcpScript() {
   return `
 const tools = JSON.parse(process.argv[process.argv.length - 1]);
 let buf = "";
@@ -96,12 +92,8 @@ process.stdin.on("data", c => {
 `.trim();
 }
 
-// Build --mcp-config JSON for a given set of named server configs + optional extras.
-// Each entry maps to a real server definition from servers.json.
-// `extras` is an array of { name, tools } to add as fake MCP servers.
 function buildMcpConfig(serverNames, extras = []) {
   const mcpServers = {};
-
   for (const name of serverNames) {
     const cfg = servers[name];
     if (!cfg) continue;
@@ -115,14 +107,12 @@ function buildMcpConfig(serverNames, extras = []) {
       ...(Object.keys(env).length ? { env } : {}),
     };
   }
-
   for (const { name, tools } of extras) {
     mcpServers[name] = {
       command: "node",
-      args: ["-e", makeFakeMcpScript(tools), "--", JSON.stringify(tools)],
+      args: ["-e", makeFakeMcpScript(), "--", JSON.stringify(tools)],
     };
   }
-
   return { mcpServers };
 }
 
@@ -130,16 +120,15 @@ function buildMcpConfig(serverNames, extras = []) {
 
 const PROMPT = "Say only: ok";
 
-async function runClaude(mcpConfig, label) {
-  const mcpConfigStr = JSON.stringify(mcpConfig);
-
+async function runClaude(mcpConfig, extraArgs = []) {
   const claudeArgs = [
     "-p", PROMPT,
     "--output-format", "json",
-    "--tools", "",                   // disable built-in tools so only MCP tools count
+    "--tools", "",
     "--no-session-persistence",
-    "--mcp-config", mcpConfigStr,
-    "--bare",                        // skip hooks, CLAUDE.md, memory, plugins
+    "--mcp-config", JSON.stringify(mcpConfig),
+    "--bare",
+    ...extraArgs,
   ];
 
   const start = Date.now();
@@ -149,121 +138,134 @@ async function runClaude(mcpConfig, label) {
       maxBuffer: 10 * 1024 * 1024,
     });
     const wallMs = Date.now() - start;
-
     const data = JSON.parse(stdout.trim());
     const u = data.usage ?? {};
-    // Total tokens that count against the context window = all input-side tokens
     const totalInput = (u.input_tokens ?? 0)
       + (u.cache_creation_input_tokens ?? 0)
       + (u.cache_read_input_tokens ?? 0);
-
     return {
-      label,
       ok: true,
-      inputTokens: u.input_tokens ?? 0,
-      cacheCreate: u.cache_creation_input_tokens ?? 0,
-      cacheRead: u.cache_read_input_tokens ?? 0,
+      inputTokens:  u.input_tokens ?? 0,
+      cacheCreate:  u.cache_creation_input_tokens ?? 0,
+      cacheRead:    u.cache_read_input_tokens ?? 0,
       totalInput,
       outputTokens: u.output_tokens ?? 0,
-      durationMs: data.duration_ms ?? wallMs,
-      wallMs,
-      costUSD: data.total_cost_usd ?? 0,
+      durationMs:   data.duration_ms ?? wallMs,
+      costUSD:      data.total_cost_usd ?? 0,
     };
   } catch (err) {
-    const wallMs = Date.now() - start;
-    console.warn(`  ⚠  claude CLI error for "${label}": ${err.message?.slice(0, 120)}`);
-    return { label, ok: false, inputTokens: 0, cacheCreate: 0, cacheRead: 0, totalInput: 0, outputTokens: 0, durationMs: wallMs, wallMs, costUSD: 0 };
+    console.warn(`  ⚠  claude CLI error: ${err.message?.slice(0, 120)}`);
+    return { ok: false, inputTokens: 0, cacheCreate: 0, cacheRead: 0, totalInput: 0, outputTokens: 0, durationMs: Date.now() - start, costUSD: 0 };
   }
 }
 
-// ─── Aggregate multiple rounds ─────────────────────────────────────────────
-
 function mean(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
 
-async function measureStrategy(label, mcpConfig, rounds) {
+async function measure(label, description, mcpConfig, rounds, extraArgs = []) {
+  process.stdout.write(`  ${label.padEnd(12)} ${description}\n`);
   const results = [];
   for (let i = 0; i < rounds; i++) {
-    if (rounds > 1) process.stdout.write(`    round ${i + 1}/${rounds}...\n`);
-    results.push(await runClaude(mcpConfig, label));
+    if (rounds > 1) process.stdout.write(`               round ${i + 1}/${rounds}...\r`);
+    results.push(await runClaude(mcpConfig, extraArgs));
   }
-  const ok = results.filter(r => r.ok);
-  if (ok.length === 0) return { label, ok: false, totalInput: 0, durationMs: 0, costUSD: 0, rounds: 0 };
+  if (rounds > 1) process.stdout.write(" ".repeat(40) + "\r");
 
-  return {
-    label,
-    ok: true,
-    rounds: ok.length,
+  const ok = results.filter(r => r.ok);
+  if (ok.length === 0) return { label, description, ok: false, totalInput: 0, inputTokens: 0, cacheCreate: 0, cacheRead: 0, outputTokens: 0, durationMs: 0, costUSD: 0 };
+
+  const result = {
+    label, description, ok: true, rounds: ok.length,
     totalInput:   Math.round(mean(ok.map(r => r.totalInput))),
     inputTokens:  Math.round(mean(ok.map(r => r.inputTokens))),
     cacheCreate:  Math.round(mean(ok.map(r => r.cacheCreate))),
     cacheRead:    Math.round(mean(ok.map(r => r.cacheRead))),
     outputTokens: Math.round(mean(ok.map(r => r.outputTokens))),
     durationMs:   Math.round(mean(ok.map(r => r.durationMs))),
-    wallMs:       Math.round(mean(ok.map(r => r.wallMs))),
     costUSD:      mean(ok.map(r => r.costUSD)),
   };
+  process.stdout.write(`               ${result.totalInput.toLocaleString()} tokens  ${result.durationMs.toLocaleString()}ms\n`);
+  return result;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────
+// ─── Main ──────────────────────────────────────────────────────────────────
 
 const serverNames = Object.keys(servers);
+const n = serverNames.length;
 
-console.log(`\nMCP Broker — Claude CLI Benchmark`);
+console.log(`\nMCP Broker Benchmark`);
+console.log(`${"─".repeat(60)}`);
 console.log(`Config:  ${configPath}`);
-console.log(`Servers: ${serverNames.join(", ")}`);
+console.log(`Servers: ${n}  (${serverNames.join(", ")})`);
 console.log(`Rounds:  ${roundsArg}`);
 console.log(`Prompt:  "${PROMPT}"\n`);
+console.log(`Running strategies...\n`);
 
-// Strategy 1 — Direct: all real servers loaded upfront
-console.log(`Strategy 1: Direct (all ${serverNames.length} servers)\n`);
-const directConfig = buildMcpConfig(serverNames);
-const directResult = await measureStrategy("direct", directConfig, roundsArg);
-process.stdout.write(`  ✓ ${directResult.totalInput.toLocaleString()} total input tokens, ${directResult.durationMs.toLocaleString()}ms\n\n`);
+const empty       = buildMcpConfig([]);
+const direct      = buildMcpConfig(serverNames);
+const brokerIdle  = buildMcpConfig([], [{ name: "broker", tools: BROKER_META_TOOLS }]);
+const brokerFull  = buildMcpConfig(serverNames, [{ name: "broker", tools: BROKER_META_TOOLS }]);
 
-// Strategy 2 — Broker idle: only 4 meta-tools
-console.log(`Strategy 2: Broker idle (meta-tools only)\n`);
-const brokerIdleConfig = buildMcpConfig([], [{ name: "broker", tools: BROKER_META_TOOLS }]);
-const brokerIdleResult = await measureStrategy("broker-idle", brokerIdleConfig, roundsArg);
-process.stdout.write(`  ✓ ${brokerIdleResult.totalInput.toLocaleString()} total input tokens, ${brokerIdleResult.durationMs.toLocaleString()}ms\n\n`);
-
-// Strategy 3 — Broker worst case: meta-tools + all real servers
-console.log(`Strategy 3: Broker worst-case (meta-tools + all ${serverNames.length} servers)\n`);
-const brokerWorstConfig = buildMcpConfig(serverNames, [{ name: "broker", tools: BROKER_META_TOOLS }]);
-const brokerWorstResult = await measureStrategy("broker-worst", brokerWorstConfig, roundsArg);
-process.stdout.write(`  ✓ ${brokerWorstResult.totalInput.toLocaleString()} total input tokens, ${brokerWorstResult.durationMs.toLocaleString()}ms\n\n`);
+const baseline  = await measure("baseline",  "no MCP servers (pure system prompt)",              empty,      roundsArg, ["--disable-slash-commands"]);
+const direct_r  = await measure("direct",    `all ${n} servers loaded upfront`,                  direct,     roundsArg);
+const broker_r  = await measure("broker",    "4 meta-tools only (idle)",                         brokerIdle, roundsArg);
+const activated = await measure("activated", `4 meta-tools + all ${n} servers (worst case)`,     brokerFull, roundsArg);
 
 // ─── Report ────────────────────────────────────────────────────────────────
 
-const col  = (s, w) => String(s).padEnd(w);
+const rows = [baseline, direct_r, broker_r, activated];
+const ok   = rows.filter(r => r.ok);
+
+if (ok.length === 0) { console.error("All strategies failed."); process.exit(1); }
+
+const W = 72;
+const colL = (s, w) => String(s).padEnd(w);
 const colR = (s, w) => String(s).padStart(w);
-const pct  = (a, base) => base > 0 ? `${((1 - a / base) * 100).toFixed(1)}% saved` : "—";
-const ms   = (v) => `${v.toLocaleString()}ms`;
-const W    = 90;
+const fmt  = (n) => n.toLocaleString();
 
-console.log(`${"─".repeat(W)}`);
-console.log(`RESULTS  (prompt: "${PROMPT}", ${roundsArg} round${roundsArg !== 1 ? "s" : ""} each)`);
-console.log(`${"─".repeat(W)}`);
-console.log(`${col("Strategy", 38)} ${colR("Total input tkns", 18)} ${colR("Savings vs direct", 20)} ${colR("Latency (mean)", 14)}`);
-console.log(`${"─".repeat(W)}`);
+console.log(`\n${"═".repeat(W)}`);
+console.log(`RESULTS  (${roundsArg} round${roundsArg !== 1 ? "s" : ""} each)`);
+console.log(`${"═".repeat(W)}\n`);
 
-const rows = [directResult, brokerIdleResult, brokerWorstResult];
+// ── Savings summary ────────────────────────────────────────────────────────
+if (baseline.ok && direct_r.ok && broker_r.ok) {
+  const sysPrompt   = baseline.totalInput;
+  const directMCP   = direct_r.totalInput - sysPrompt;
+  const brokerMCP   = broker_r.totalInput - sysPrompt;
+  const savedTokens = direct_r.totalInput - broker_r.totalInput;
+  const savedPct    = (savedTokens / direct_r.totalInput * 100).toFixed(1);
+  const savedCost   = direct_r.costUSD - broker_r.costUSD;
+  const saved1k     = savedCost * 1000;
+
+  console.log(`  Without broker   ${fmt(directMCP)} tokens of MCP schema injected per request`);
+  console.log(`  With broker      ${fmt(brokerMCP)} tokens              (${savedPct}% less, −${fmt(savedTokens)} tokens/req)`);
+  console.log(`  Cost saving      $${savedCost.toFixed(5)} per request   ≈ $${saved1k.toFixed(2)} per 1,000 requests`);
+  console.log();
+}
+
+// ── Per-strategy table ─────────────────────────────────────────────────────
+console.log(`${colL("Strategy", 14)} ${colR("Tokens", 10)} ${colR("Token cost", 12)} ${colR("vs direct", 12)} ${colR("Latency", 9)}`);
+console.log(`${"─".repeat(W)}`);
 for (const r of rows) {
-  if (!r.ok) {
-    console.log(`${col(r.label, 38)} ${colR("ERROR", 18)} ${colR("—", 20)} ${colR("—", 14)}`);
-    continue;
-  }
-  const savings = r.label === "direct" ? "baseline" : pct(r.totalInput, directResult.totalInput);
-  console.log(`${col(r.label, 38)} ${colR(r.totalInput.toLocaleString(), 18)} ${colR(savings, 20)} ${colR(ms(r.durationMs), 14)}`);
+  if (!r.ok) { console.log(`${colL(r.label, 14)} ${"ERROR".padStart(10)}`); continue; }
+  const vsDir = (r.label === "direct" || r.label === "baseline")
+    ? ""
+    : (() => {
+        if (!direct_r.ok) return "—";
+        const saved = direct_r.totalInput - r.totalInput;
+        return saved > 0 ? `−${fmt(saved)}` : `+${fmt(-saved)}`;
+      })();
+  console.log(`${colL(r.label, 14)} ${colR(fmt(r.totalInput), 10)} ${colR("$" + r.costUSD.toFixed(5), 12)} ${colR(vsDir, 12)} ${colR(fmt(r.durationMs) + "ms", 9)}`);
 }
-
 console.log(`${"─".repeat(W)}`);
-console.log(`\nToken breakdown (cache_create + cache_read + uncached = total):`);
-for (const r of rows.filter(r => r.ok)) {
-  console.log(`  ${col(r.label, 30)} ${r.cacheCreate.toLocaleString()} create + ${r.cacheRead.toLocaleString()} read + ${r.inputTokens.toLocaleString()} uncached = ${r.totalInput.toLocaleString()}`);
+console.log(`  baseline = no MCP at all  |  activated = broker + all servers loaded`);
+
+// ── Cache breakdown ────────────────────────────────────────────────────────
+console.log(`\n${"─".repeat(W)}`);
+console.log(`CACHE BREAKDOWN\n`);
+console.log(`${colL("Strategy", 14)} ${colR("uncached", 10)} ${colR("cache write", 13)} ${colR("cache read", 12)} ${colR("total", 8)}`);
+console.log(`${"─".repeat(W)}`);
+for (const r of ok) {
+  console.log(`${colL(r.label, 14)} ${colR(fmt(r.inputTokens), 10)} ${colR(fmt(r.cacheCreate), 13)} ${colR(fmt(r.cacheRead), 12)} ${colR(fmt(r.totalInput), 8)}`);
 }
 
-console.log(`\nCost per request (mean):`);
-for (const r of rows.filter(r => r.ok)) {
-  console.log(`  ${col(r.label, 30)} $${r.costUSD.toFixed(6)}`);
-}
-console.log(`\n`);
+console.log(`\n${"─".repeat(W)}\n`);

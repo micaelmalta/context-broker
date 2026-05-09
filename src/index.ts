@@ -17,6 +17,7 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { ToolRouter, ServerConfig } from "./router.js";
 import { ProcessManager } from "./process-manager.js";
+import { SkillRouter, SkillConfig } from "./skill-router.js";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -29,8 +30,8 @@ function resolveConfigPath(): string {
     return p;
   }
 
-  // ~/.config/mcp-broker/servers.json
-  const xdg = resolve(homedir(), ".config", "mcp-broker", "servers.json");
+  // ~/.config/context-broker/servers.json
+  const xdg = resolve(homedir(), ".config", "context-broker", "servers.json");
   if (existsSync(xdg)) return xdg;
 
   // fallback: bundled config (dev / local clone)
@@ -39,17 +40,48 @@ function resolveConfigPath(): string {
   if (existsSync(local)) return local;
 
   throw new Error(
-    `No config found. Create ~/.config/mcp-broker/servers.json or pass --config <path>.`
+    `No config found. Create ~/.config/context-broker/servers.json or pass --config <path>.`
   );
 }
 
 const configPath = resolveConfigPath();
 const config = JSON.parse(readFileSync(configPath, "utf-8"));
 const serverConfigs: Record<string, ServerConfig> = config.servers;
-console.error(`[mcp-broker] Config: ${configPath}`);
+console.error(`[context-broker] Config: ${configPath}`);
 
 const router = new ToolRouter(serverConfigs);
 const manager = new ProcessManager();
+
+// ─── Skills ────────────────────────────────────────────────────────────────
+
+function resolveSkillsConfigPath(): string | null {
+  const flagIdx = process.argv.indexOf("--skills");
+  if (flagIdx !== -1 && process.argv[flagIdx + 1]) {
+    const p = resolve(process.argv[flagIdx + 1]);
+    if (!existsSync(p)) throw new Error(`Skills config not found: ${p}`);
+    return p;
+  }
+
+  const xdg = resolve(homedir(), ".config", "context-broker", "skills.json");
+  if (existsSync(xdg)) return xdg;
+
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const local = resolve(__dirname, "../config/skills.json");
+  if (existsSync(local)) return local;
+
+  return null;
+}
+
+const skillsConfigPath = resolveSkillsConfigPath();
+const skillRouter = skillsConfigPath
+  ? new SkillRouter(
+      (JSON.parse(readFileSync(skillsConfigPath, "utf-8")) as { skills: Record<string, SkillConfig> }).skills
+    )
+  : null;
+
+if (skillsConfigPath) {
+  console.error(`[context-broker] Skills config: ${skillsConfigPath}`);
+}
 
 // ─── Meta-tools always exposed ─────────────────────────────────────────────
 
@@ -107,13 +139,38 @@ const META_TOOLS: Tool[] = [
       type: "object",
       properties: {}
     }
+  },
+  {
+    name: "discover_skill",
+    description:
+      "Find the right skill for a task before executing it. " +
+      "Call this at the start of any task that produces a file or " +
+      "requires specialist knowledge.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What you are trying to do" }
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "load_skill",
+    description: "Load a skill's full instructions into context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        skill_name: { type: "string", description: "Name returned by discover_skill" }
+      },
+      required: ["skill_name"]
+    }
   }
 ];
 
 // ─── MCP Server ────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "mcp-broker", version: "1.0.0" },
+  { name: "context-broker", version: "1.0.0" },
   { capabilities: { tools: { listChanged: true } } }
 );
 
@@ -233,6 +290,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
+  // ── Meta-tool: discover_skill ────────────────────────────────────────────
+  if (name === "discover_skill") {
+    if (!skillRouter) {
+      return {
+        content: [{ type: "text", text: "No skills registry configured." }]
+      };
+    }
+
+    const query = args?.query as string;
+    const ranked = skillRouter.rank(query);
+
+    if (ranked.length === 0) {
+      return {
+        content: [{
+          type: "text",
+          text: `No matching skills found for: "${query}"\n\nAvailable skills:\n` +
+            skillRouter.listAll().map(n => {
+              const cfg = skillRouter.getConfig(n)!;
+              return `• ${n}: ${cfg.description}`;
+            }).join("\n")
+        }]
+      };
+    }
+
+    const lines = ranked.map(r => {
+      const cfg = skillRouter.getConfig(r.name)!;
+      return `${r.name} (score: ${r.score})\n  ${cfg.description}\n  Keywords matched: ${r.reason.join(", ")}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: `Skills relevant to "${query}":\n\n${lines.join("\n\n")}\n\n` +
+          `Use load_skill to load a skill's full instructions.`
+      }]
+    };
+  }
+
+  // ── Meta-tool: load_skill ────────────────────────────────────────────────
+  if (name === "load_skill") {
+    if (!skillRouter) {
+      return {
+        content: [{ type: "text", text: "No skills registry configured." }]
+      };
+    }
+
+    const skillName = args?.skill_name as string;
+    try {
+      const content = skillRouter.load(skillName);
+      return {
+        content: [{
+          type: "text",
+          text: `# Skill: ${skillName}\n\n${content}`
+        }]
+      };
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: (err as Error).message }]
+      };
+    }
+  }
+
   // ── Proxy to active server ───────────────────────────────────────────────
   const serverName = manager.findServerForTool(name);
   if (!serverName) {
@@ -275,7 +394,7 @@ for (const [name, cfg] of Object.entries(serverConfigs)) {
       await manager.activate(name, cfg);
       await server.notification({ method: "notifications/tools/list_changed", params: {} });
     } catch (err) {
-      console.error(`[mcp-broker] Failed to auto-activate "${name}": ${(err as Error).message}`);
+      console.error(`[context-broker] Failed to auto-activate "${name}": ${(err as Error).message}`);
     }
   }
 }
@@ -296,4 +415,4 @@ process.on("SIGTERM", shutdown);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[mcp-broker] Running on stdio");
+console.error("[context-broker] Running on stdio");

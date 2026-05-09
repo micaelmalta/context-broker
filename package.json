@@ -1,11 +1,11 @@
 {
-    "name": "mcp-broker",
+    "name": "context-broker",
     "version": "1.0.0",
     "description": "Lazy-loading MCP broker for Claude Code",
     "type": "module",
     "main": "dist/index.js",
     "bin": {
-        "mcp-broker": "./dist/index.js"
+        "context-broker": "./dist/index.js"
     },
     "files": [
         "dist",
@@ -13,11 +13,11 @@
     ],
     "repository": {
         "type": "git",
-        "url": "https://github.com/micaelmalta/mcp-broker.git"
+        "url": "https://github.com/micaelmalta/context-broker.git"
     },
-    "homepage": "https://github.com/micaelmalta/mcp-broker",
+    "homepage": "https://github.com/micaelmalta/context-broker",
     "bugs": {
-        "url": "https://github.com/micaelmalta/mcp-broker/issues"
+        "url": "https://github.com/micaelmalta/context-broker/issues"
     },
     "scripts": {
         "build": "tsc",

@@ -4,9 +4,15 @@
 export interface ServerConfig {
   description: string;
   keywords: string[];
-  command: string;
-  args: string[];
+  // stdio transport (default)
+  command?: string;
+  args?: string[];
   env?: Record<string, string>;
+  // http transport
+  type?: "http" | "stdio";
+  url?: string;
+  headers?: Record<string, string>;
+  oauth?: { clientId: string; callbackPort: number; scopes?: string[] };
   autoActivate: boolean;
 }
 

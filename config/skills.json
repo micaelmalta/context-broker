@@ -1,0 +1,29 @@
+{
+  "skills": {
+    "docx": {
+      "description": "Create or edit Word documents (.docx)",
+      "keywords": ["word", "document", "docx", "report", "letter", "memo"],
+      "path": "/mnt/skills/public/docx/SKILL.md"
+    },
+    "pptx": {
+      "description": "Create or edit PowerPoint presentations",
+      "keywords": ["presentation", "slides", "powerpoint", "pptx", "deck"],
+      "path": "/mnt/skills/public/pptx/SKILL.md"
+    },
+    "pdf": {
+      "description": "Create, read, or manipulate PDF files",
+      "keywords": ["pdf", "portable", "export", "fillable", "form"],
+      "path": "/mnt/skills/public/pdf/SKILL.md"
+    },
+    "xlsx": {
+      "description": "Create or edit Excel spreadsheets",
+      "keywords": ["excel", "spreadsheet", "xlsx", "csv", "table", "chart"],
+      "path": "/mnt/skills/public/xlsx/SKILL.md"
+    },
+    "frontend": {
+      "description": "Build React components and web UIs",
+      "keywords": ["react", "component", "ui", "frontend", "html", "css", "web"],
+      "path": "/mnt/skills/public/frontend-design/SKILL.md"
+    }
+  }
+}

@@ -1,14 +1,25 @@
 // src/process-manager.ts
-// Manages lifecycle of child MCP server processes
+// Manages lifecycle of child MCP server processes (stdio) and HTTP MCP servers
 
 import { spawn, ChildProcess } from "child_process";
 import { ServerConfig } from "./router.js";
+import { getAccessToken } from "./oauth.js";
 
 export interface ActiveServer {
   name: string;
   process: ChildProcess;
   tools: MCPTool[];
   activatedAt: Date;
+}
+
+export interface ActiveHttpServer {
+  name: string;
+  url: string;
+  headers: Record<string, string>;
+  tools: MCPTool[];
+  activatedAt: Date;
+  nextId: number;
+  config: ServerConfig;  // kept for token refresh on 401
 }
 
 export interface MCPTool {
@@ -20,6 +31,7 @@ export interface MCPTool {
 
 export class ProcessManager {
   private active = new Map<string, ActiveServer>();
+  private activeHttp = new Map<string, ActiveHttpServer>();
   // Keyed by child process so IDs are scoped per-child and never collide
   private pendingRequests = new Map<ChildProcess, Map<number, {
     resolve: (val: unknown) => void;
@@ -31,19 +43,21 @@ export class ProcessManager {
   private requestIds = new Map<ChildProcess, number>();
 
   async activate(name: string, config: ServerConfig): Promise<MCPTool[]> {
-    if (this.active.has(name)) {
-      return this.active.get(name)!.tools;
-    }
+    if (this.active.has(name)) return this.active.get(name)!.tools;
+    if (this.activeHttp.has(name)) return this.activeHttp.get(name)!.tools;
 
     console.error(`[router] Activating server: ${name}`);
+
+    if (config.type === "http" || config.url) {
+      return this.activateHttp(name, config);
+    }
 
     // Resolve env vars from process environment
     const env = this.resolveEnv(config.env ?? {});
 
-    const child = spawn(config.command, config.args, {
+    const child = spawn(config.command!, config.args ?? [], {
       env: { ...process.env, ...env },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
+    }) as ChildProcess;
 
     child.stderr?.on("data", (data) => {
       console.error(`[${name}] ${data.toString().trim()}`);
@@ -112,15 +126,46 @@ export class ProcessManager {
     return tools;
   }
 
+  private async activateHttp(name: string, config: ServerConfig): Promise<MCPTool[]> {
+    const url = config.url!;
+    const resolvedEnv = this.resolveEnv(config.env ?? {});
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+    // Resolve ${VAR} in explicit headers
+    for (const [k, v] of Object.entries(config.headers ?? {})) {
+      headers[k] = v.replace(/\$\{(\w+)\}/g, (_, n) => process.env[n] ?? resolvedEnv[n] ?? "");
+    }
+
+    // OAuth PKCE flow — fetches/refreshes token automatically
+    if (config.oauth) {
+      const token = await getAccessToken(name, url, config.oauth);
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+
+    const tools = await this.fetchToolsHttp(url, headers, name);
+
+    this.activeHttp.set(name, {
+      name, url, headers, tools, config,
+      activatedAt: new Date(),
+      nextId: 1,
+    });
+
+    console.error(`[router] ${name} (http) activated with ${tools.length} tools`);
+    return tools;
+  }
+
   async callTool(
     serverName: string,
     toolName: string,
     args: Record<string, unknown>
   ): Promise<{ content: unknown[] }> {
-    const server = this.active.get(serverName);
-    if (!server) {
-      throw new Error(`Server ${serverName} is not active`);
+    const httpServer = this.activeHttp.get(serverName);
+    if (httpServer) {
+      return this.callToolHttp(httpServer, toolName, args);
     }
+
+    const server = this.active.get(serverName);
+    if (!server) throw new Error(`Server ${serverName} is not active`);
 
     const child = server.process;
     const id = this.nextId(child);
@@ -132,7 +177,42 @@ export class ProcessManager {
     }) as Promise<{ content: unknown[] }>;
   }
 
+  private async callToolHttp(
+    server: ActiveHttpServer,
+    toolName: string,
+    args: Record<string, unknown>
+  ): Promise<{ content: unknown[] }> {
+    const id = server.nextId++;
+    const body = JSON.stringify({
+      jsonrpc: "2.0", id,
+      method: "tools/call",
+      params: { name: toolName, arguments: args },
+    });
+
+    let res = await fetch(server.url, { method: "POST", headers: server.headers, body });
+
+    // On 401, attempt token refresh and retry once
+    if (res.status === 401 && server.config.oauth) {
+      console.error(`[router] ${server.name} returned 401 — refreshing OAuth token`);
+      const token = await getAccessToken(server.name, server.url, server.config.oauth);
+      server.headers["Authorization"] = `Bearer ${token}`;
+      res = await fetch(server.url, { method: "POST", headers: server.headers, body });
+    }
+
+    if (!res.ok) throw new Error(`HTTP ${res.status} from ${server.name}: ${await res.text()}`);
+
+    const data = await res.json() as { result?: { content: unknown[] }; error?: { message: string } };
+    if (data.error) throw new Error(data.error.message);
+    return data.result ?? { content: [] };
+  }
+
   deactivate(name: string): void {
+    if (this.activeHttp.has(name)) {
+      this.activeHttp.delete(name);
+      console.error(`[router] Deactivated server: ${name}`);
+      return;
+    }
+
     const server = this.active.get(name);
     if (server) {
       const child = server.process;
@@ -153,18 +233,25 @@ export class ProcessManager {
   }
 
   listActive(): string[] {
-    return Array.from(this.active.keys());
+    return [
+      ...Array.from(this.active.keys()),
+      ...Array.from(this.activeHttp.keys()),
+    ];
   }
 
   getAllActiveTools(): MCPTool[] {
-    return Array.from(this.active.values()).flatMap(s => s.tools);
+    return [
+      ...Array.from(this.active.values()).flatMap(s => s.tools),
+      ...Array.from(this.activeHttp.values()).flatMap(s => s.tools),
+    ];
   }
 
   findServerForTool(toolName: string): string | undefined {
     for (const [name, server] of this.active.entries()) {
-      if (server.tools.some(t => t.name === toolName)) {
-        return name;
-      }
+      if (server.tools.some(t => t.name === toolName)) return name;
+    }
+    for (const [name, server] of this.activeHttp.entries()) {
+      if (server.tools.some(t => t.name === toolName)) return name;
     }
     return undefined;
   }
@@ -186,6 +273,54 @@ export class ProcessManager {
     return resolved;
   }
 
+  private async fetchToolsHttp(
+    url: string,
+    headers: Record<string, string>,
+    serverName: string
+  ): Promise<MCPTool[]> {
+    // MCP HTTP: initialize then tools/list
+    const initBody = JSON.stringify({
+      jsonrpc: "2.0", id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "context-broker", version: "1.0.0" },
+      },
+    });
+
+    const initRes = await fetch(url, { method: "POST", headers, body: initBody });
+    if (!initRes.ok) throw new Error(`HTTP ${initRes.status} initializing ${serverName}: ${await initRes.text()}`);
+
+    type ToolsListResult = {
+      tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
+      nextCursor?: string;
+    };
+
+    const allTools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [];
+    let cursor: string | undefined;
+    let reqId = 2;
+
+    do {
+      const listBody = JSON.stringify({
+        jsonrpc: "2.0", id: reqId++,
+        method: "tools/list",
+        params: cursor ? { cursor } : {},
+      });
+
+      const listRes = await fetch(url, { method: "POST", headers, body: listBody });
+      if (!listRes.ok) throw new Error(`HTTP ${listRes.status} listing tools for ${serverName}`);
+
+      const data = await listRes.json() as { result?: ToolsListResult; error?: { message: string } };
+      if (data.error) throw new Error(data.error.message);
+
+      allTools.push(...(data.result?.tools ?? []));
+      cursor = data.result?.nextCursor;
+    } while (cursor);
+
+    return allTools.map(t => ({ ...t, serverName }));
+  }
+
   private async fetchTools(
     child: ChildProcess,
     serverName: string,
@@ -202,7 +337,7 @@ export class ProcessManager {
         params: {
           protocolVersion: "2024-11-05",
           capabilities: {},
-          clientInfo: { name: "mcp-broker", version: "1.0.0" }
+          clientInfo: { name: "context-broker", version: "1.0.0" }
         }
       },
       t
