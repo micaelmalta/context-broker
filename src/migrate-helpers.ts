@@ -60,9 +60,9 @@ export function detectShellSecretFile(): ShellSecretFile {
 export function resolveBrokerEntry(distDir: string): BrokerEntry {
   try {
     const bin = execSync("command -v context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
-    // Reject npx shims — check path components for node_modules or _npx
-    const binParts = bin.split(/[\\/]/);
-    if (bin && !binParts.includes("node_modules") && !binParts.includes("_npx")) {
+    // Reject npx temp shims only — _npx is npm's cache dir for npx runs
+    // node_modules alone is valid (e.g. /usr/local/lib/node_modules/.bin/context-broker)
+    if (bin && !bin.split(/[\\/]/).includes("_npx")) {
       return { command: bin, args: [] };
     }
   } catch { /* not installed globally */ }

@@ -145,11 +145,10 @@ describe("resolveBrokerEntry", () => {
     expect(result.command).toBe("/usr/bin/context-broker");
   });
 
-  it("rejects npx shim returned by which (contains node_modules)", () => {
-    mockExecSyncFn.mockReturnValue("/home/user/.npm/_npx/abc/node_modules/.bin/context-broker\n");
-    mockExistsSyncFn.mockReturnValue(true);
+  it("accepts global install under node_modules (legitimate path)", () => {
+    mockExecSyncFn.mockReturnValue("/usr/local/lib/node_modules/.bin/context-broker\n");
     const result = resolveBrokerEntry("/some/dist");
-    expect(result).toEqual({ command: "node", args: ["/some/dist/index.js"] });
+    expect(result.command).toBe("/usr/local/lib/node_modules/.bin/context-broker");
   });
 
   it("rejects npx shim returned by which (contains _npx)", () => {
