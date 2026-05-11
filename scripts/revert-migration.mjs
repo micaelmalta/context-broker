@@ -1,12 +1,10 @@
 #!/usr/bin/env node
 // Reverts a previous `migrate.mjs` run:
 //   - Removes entries from ~/.config/context-broker/servers.json whose description
-//     matches "Migrated from <source>" (the marker migrate.mjs stamps on each entry)
-//   - Removes entries from ~/.config/context-broker/skills.json whose migratedFrom
-//     field matches a known source, and moves skill dirs back with INSTRUCTIONS.md merged
-//   - With --plugins, removes all plugin entries from skills.json and restores
-//     SKILL.md files from their INSTRUCTIONS.md sibling
-//   - Removes the corresponding secret block from ~/.zshenv
+//     matches "Migrated from <source>" and restores them to the source config
+//   - Removes skill/command entries from skills.json (identified by migratedFrom or plugin)
+//     and merges INSTRUCTIONS.md back into SKILL.md in-place
+//   - Removes the SessionStart session-sync hook from ~/.claude/settings.json
 //
 // Usage:
 //   node scripts/revert-migration.mjs                        # reverts all sources
@@ -20,7 +18,7 @@
 //   node scripts/revert-migration.mjs --plugins
 //   node scripts/revert-migration.mjs --dry-run
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, lstatSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 import { resolve, basename } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -60,6 +58,17 @@ function resolveLabels() {
   if (fromArg) return [fromArg];
   return Object.keys({ ...SERVER_SOURCES, ...SKILLS_SOURCES })
     .filter((v, i, a) => a.indexOf(v) === i); // unique
+}
+
+// Merge INSTRUCTIONS.md back into SKILL.md at the given SKILL.md path.
+function mergeInstructions(skillPath) {
+  const instructionsPath = skillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
+  if (!existsSync(instructionsPath) || !existsSync(skillPath)) return false;
+  const stub = readFileSync(skillPath, "utf-8");
+  const body = readFileSync(instructionsPath, "utf-8");
+  writeFileSync(skillPath, (stub.endsWith("\n") ? stub : stub + "\n") + "\n" + body);
+  unlinkSync(instructionsPath);
+  return true;
 }
 
 // ─── Servers revert ────────────────────────────────────────────────────────
@@ -175,6 +184,8 @@ if (revertServers) {
 }
 
 // ─── Skills revert ─────────────────────────────────────────────────────────
+// Skills and commands were registered in-place, so revert just removes registry
+// entries and merges INSTRUCTIONS.md back into SKILL.md where applicable.
 
 if (revertSkills) {
   const skillsPath = skillsConfigArg
@@ -186,70 +197,35 @@ if (revertSkills) {
   } else {
     const skillsFile = JSON.parse(readFileSync(skillsPath, "utf-8"));
     const skills = skillsFile.skills ?? {};
-    const brokerSkillsDir = resolve(homedir(), ".config", "context-broker", "skills");
     const labels = resolveLabels();
-
     let anyFound = false;
 
     for (const label of labels) {
-      const skillsDir = SKILLS_SOURCES[label] ?? resolve(label, "skills");
-      const skillsToRemove = Object.entries(skills)
+      const toRemove = Object.entries(skills)
         .filter(([, cfg]) => cfg.migratedFrom === label)
         .map(([name]) => name);
 
-      if (skillsToRemove.length === 0) continue;
+      if (toRemove.length === 0) continue;
       anyFound = true;
 
-      console.log(`\nSkills (${label}): removing ${skillsToRemove.length} entries, restoring to ${skillsDir}`);
-
-      // Group by the top-level broker dir to move (namespace dirs move as a unit)
-      // name may be "skill" (flat) or "namespace/skill" (nested)
-      const brokerDirsToMove = new Map(); // brokerTopDir -> srcTopDir
-      for (const name of skillsToRemove) {
-        const parts = name.split("/");
-        const topLevel = parts[0];
-        brokerDirsToMove.set(resolve(brokerSkillsDir, topLevel), resolve(skillsDir, topLevel));
-      }
+      console.log(`\nSkills (${label}): removing ${toRemove.length} entries`);
 
       if (dryRun) {
-        for (const name of skillsToRemove) {
-          const skillDir = resolve(brokerSkillsDir, ...name.split("/"));
-          const instructionsPath = resolve(skillDir, "INSTRUCTIONS.md");
-          console.log(`  ${name}: ${existsSync(instructionsPath) ? "merge INSTRUCTIONS.md → SKILL.md, " : ""}move to ${skillsDir}/${name.split("/")[0]}`);
-        }
-        for (const [brokerTop, srcTop] of brokerDirsToMove) {
-          let symlinkNote = "";
-          try { if (lstatSync(srcTop).isSymbolicLink()) symlinkNote = " (remove symlink)"; } catch {}
-          console.log(`  move ${brokerTop} → ${srcTop}${symlinkNote}`);
+        for (const name of toRemove) {
+          const cfg = skills[name];
+          const isSkill = cfg.path?.endsWith("SKILL.md");
+          const instructionsPath = isSkill ? cfg.path.replace(/SKILL\.md$/, "INSTRUCTIONS.md") : null;
+          const mergeNote = instructionsPath && existsSync(instructionsPath) ? " (merge INSTRUCTIONS.md → SKILL.md)" : "";
+          console.log(`  ${name}${mergeNote}`);
         }
       } else {
-        // First merge all INSTRUCTIONS.md back into SKILL.md
         let mergedCount = 0;
-        for (const name of skillsToRemove) {
-          const skillDir = resolve(brokerSkillsDir, ...name.split("/"));
-          const instructionsPath = resolve(skillDir, "INSTRUCTIONS.md");
-          const skillMdPath = resolve(skillDir, "SKILL.md");
-          if (existsSync(instructionsPath) && existsSync(skillMdPath)) {
-            const stub = readFileSync(skillMdPath, "utf-8");
-            const body = readFileSync(instructionsPath, "utf-8");
-            writeFileSync(skillMdPath, (stub.endsWith("\n") ? stub : stub + "\n") + "\n" + body);
-            unlinkSync(instructionsPath);
-            mergedCount++;
-          }
+        for (const name of toRemove) {
+          const cfg = skills[name];
+          if (cfg.path?.endsWith("SKILL.md") && mergeInstructions(cfg.path)) mergedCount++;
           delete skills[name];
         }
-
-        // Then move each top-level broker dir back (once per namespace/skill)
-        let movedCount = 0;
-        for (const [brokerTop, srcTop] of brokerDirsToMove) {
-          try { if (lstatSync(srcTop).isSymbolicLink()) unlinkSync(srcTop); } catch {}
-          if (existsSync(brokerTop)) {
-            renameSync(brokerTop, srcTop);
-            movedCount++;
-          }
-        }
-        console.log(`✓ Merged INSTRUCTIONS.md into SKILL.md for ${mergedCount} skill(s)`);
-        console.log(`✓ Moved ${movedCount} dir(s) back to ${skillsDir}`);
+        if (mergedCount > 0) console.log(`✓ Merged INSTRUCTIONS.md into SKILL.md for ${mergedCount} skill(s)`);
       }
     }
 
@@ -267,6 +243,8 @@ if (revertSkills) {
 }
 
 // ─── Plugins revert ────────────────────────────────────────────────────────
+// Plugin files stay in ~/.claude/plugins/cache — revert merges INSTRUCTIONS.md
+// back into SKILL.md in-place and removes plugin entries from skills.json.
 
 if (revertPlugins) {
   const skillsPath = skillsConfigArg
@@ -299,22 +277,14 @@ if (revertPlugins) {
       if (dryRun) {
         if (pluginEntries.length > 0) console.log(`  Would remove ${pluginEntries.length} entries from skills.json`);
         if (instructionsFiles.length > 0) console.log(`  Would restore ${instructionsFiles.length} SKILL.md files from INSTRUCTIONS.md`);
-        console.log(`  Would remove split-skills SessionStart hook from ~/.claude/settings.json`);
+        console.log(`  Would remove session-sync SessionStart hook from ~/.claude/settings.json`);
       } else {
-        // Restore SKILL.md: merge frontmatter stub with body from INSTRUCTIONS.md
         let restored = 0;
         for (const instructionsPath of instructionsFiles) {
           const skillPath = instructionsPath.replace(/INSTRUCTIONS\.md$/, "SKILL.md");
-          if (!existsSync(skillPath)) continue;
-          const stub = readFileSync(skillPath, "utf-8");
-          const body = readFileSync(instructionsPath, "utf-8");
-          const stubNormalized = stub.endsWith("\n") ? stub : stub + "\n";
-          writeFileSync(skillPath, stubNormalized + "\n" + body);
-          unlinkSync(instructionsPath);
-          restored++;
+          if (mergeInstructions(skillPath)) restored++;
         }
 
-        // Remove plugin entries from skills.json
         const remaining = Object.fromEntries(
           Object.entries(skills).filter(([, cfg]) => !cfg.plugin)
         );
@@ -322,7 +292,7 @@ if (revertPlugins) {
         if (restored > 0) console.log(`✓ Restored ${restored} SKILL.md files`);
         if (pluginEntries.length > 0) console.log(`✓ Removed ${pluginEntries.length} plugin entries from ${skillsPath}`);
 
-        // Remove the SessionStart session-sync hook from ~/.claude/settings.json
+        // Remove the SessionStart session-sync hook
         const settingsPath = resolve(homedir(), ".claude", "settings.json");
         if (existsSync(settingsPath)) {
           const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));

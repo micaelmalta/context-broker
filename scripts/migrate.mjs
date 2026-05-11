@@ -1,10 +1,8 @@
 #!/usr/bin/env node
 // Migrates MCP server configs from Cursor, Claude Code, OpenCode, or Agents into
 // ~/.config/context-broker/servers.json.
-// Also moves skills directories into ~/.config/context-broker/skills/,
-// registers them in skills.json, and leaves symlinks so slash commands still work.
-// With --plugins, splits ~/.claude/plugins/cache/**/SKILL.md into stubs +
-// INSTRUCTIONS.md and registers all plugin skills in skills.json.
+// Registers skills and commands in-place (no file moves) in skills.json, and
+// splits SKILL.md into frontmatter stub + INSTRUCTIONS.md where they live.
 // Detected secrets are extracted to the shell config file (~/.bashrc for bash,
 // ~/.zshenv for zsh, ~/.config/fish/config.fish for fish) and replaced with ${VAR} refs.
 // Requires: npm run build (produces dist/migrate-helpers.js)
@@ -21,8 +19,8 @@
 //   node scripts/migrate.mjs --plugins
 //   node scripts/migrate.mjs --dry-run
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatSync, renameSync, symlinkSync, copyFileSync } from "fs";
-import { resolve, dirname, basename, relative } from "path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatSync, copyFileSync } from "fs";
+import { resolve, dirname, basename, relative, extname } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
 import { fileURLToPath, pathToFileURL } from "url";
@@ -61,7 +59,6 @@ const SKILLS_SOURCES = {
   agents:   resolve(homedir(), ".agents", "skills"),
 };
 
-// When --from is given, use just that source; otherwise discover all known ones.
 function resolveServerSources() {
   if (fromArg) {
     const path = SERVER_SOURCES[fromArg] ?? resolve(fromArg);
@@ -103,6 +100,51 @@ function deriveKeywords(name, cfg) {
     if (text.includes(kw)) words.add(kw);
   }
   return [...words];
+}
+
+// Split a SKILL.md into frontmatter stub + INSTRUCTIONS.md in-place.
+// Returns true if a split was performed.
+function splitSkillMd(skillPath) {
+  if (!existsSync(skillPath)) return false;
+  const instructionsPath = skillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
+  if (existsSync(instructionsPath)) return false;
+  const content = readFileSync(skillPath, "utf-8");
+  const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
+  if (!match) return false;
+  const body = match[2].replace(/^\n+/, "");
+  if (!body) return false;
+  writeFileSync(skillPath, match[1]);
+  writeFileSync(instructionsPath, body);
+  return true;
+}
+
+// Build a registry entry from a SKILL.md path.
+// If the file has a frontmatter `description` field, it takes priority over the first prose line.
+function skillEntry(key, skillPath, extra = {}) {
+  const content = readFileSync(skillPath, "utf-8");
+  const fmMatch = content.match(/^---\n[\s\S]*?\n---/);
+  let fmDescription = null;
+  if (fmMatch) {
+    const descMatch = fmMatch[0].match(/^description:\s*(.+)$/m);
+    if (descMatch) fmDescription = descMatch[1].trim().replace(/^["']|["']$/g, "");
+  }
+  const firstLine = content.split("\n").find(l => l.match(/^[A-Za-z]/)) ?? "";
+  const description = (fmDescription ?? firstLine).slice(0, 120) || `Skill: ${key}`;
+  const words = new Set();
+  key.toLowerCase().split(/[-_/\s:]+/).forEach(w => w.length > 2 && words.add(w));
+  description.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
+  return { description, keywords: [...words], path: skillPath, ...extra };
+}
+
+// Build a registry entry from a command .md path.
+function commandEntry(key, cmdPath, extra = {}) {
+  const content = readFileSync(cmdPath, "utf-8");
+  const firstLine = content.split("\n").find(l => l.match(/^[A-Za-z]/)) ?? "";
+  const description = firstLine.replace(/^#+\s*/, "").slice(0, 120) || `Command: ${key}`;
+  const words = new Set();
+  key.toLowerCase().split(/[-_/\s:]+/).forEach(w => w.length > 2 && words.add(w));
+  description.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 8).forEach(w => words.add(w));
+  return { description, keywords: [...words], path: cmdPath, ...extra };
 }
 
 // ─── Servers migration ─────────────────────────────────────────────────────
@@ -303,9 +345,11 @@ if (migrateServers) {
 }
 
 // ─── Skills migration ──────────────────────────────────────────────────────
+// Skills and commands stay in their original directories — only paths are
+// registered in skills.json. SKILL.md files are split into stub + INSTRUCTIONS.md
+// in-place.
 
 if (migrateSkills) {
-  const brokerSkillsDir = resolve(homedir(), ".config", "context-broker", "skills");
   const skillsOutPath = skillsOutArg ?? resolve(homedir(), ".config", "context-broker", "skills.json");
 
   let existingSkills = { skills: {} };
@@ -319,113 +363,81 @@ if (migrateSkills) {
       continue;
     }
 
-    const convertedSkills = {};
-    const skippedSkills = [];
+    const converted = {};
+    const skipped = [];
 
-    // Returns registry entries for a skill dir. key is the registry name (may include namespace),
-    // srcDir is the actual directory to move, dstDir is where it lands in the broker.
-    function collectSkill(key, srcSkillPath, _srcDir, dstDir) {
-      const content = readFileSync(srcSkillPath, "utf-8");
-      const firstLine = content.split("\n").find(l => l.match(/^[A-Z]/)) ?? "";
-      const description = firstLine.slice(0, 120) || `Skill: ${key}`;
-      const words = new Set();
-      key.toLowerCase().split(/[-_/\s]+/).forEach(w => w.length > 2 && words.add(w));
-      firstLine.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
-      return {
-        description,
-        keywords: [...words],
-        path: resolve(dstDir, "SKILL.md"),
-        migratedFrom: label,
-      };
-    }
-
-    for (const entry of readdirSync(skillsDir)) {
-      const srcDir = resolve(skillsDir, entry);
-      const lstat = lstatSync(srcDir);
-      // skip non-directories and already-migrated symlinks
-      if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
-
-      const srcSkillPath = resolve(srcDir, "SKILL.md");
-      if (existsSync(srcSkillPath)) {
-        // flat skill at top level
-        const dstDir = resolve(brokerSkillsDir, entry);
-        convertedSkills[entry] = { ...collectSkill(entry, srcSkillPath, srcDir, dstDir), _srcDir: srcDir, _dstDir: dstDir };
-      } else {
-        // check for namespace: subdirs containing SKILL.md
-        let hasSkills = false;
-        for (const sub of readdirSync(srcDir)) {
-          const subDir = resolve(srcDir, sub);
-          const subLstat = lstatSync(subDir);
-          if (subLstat.isSymbolicLink() || !subLstat.isDirectory()) continue;
-          const subSkillPath = resolve(subDir, "SKILL.md");
-          if (!existsSync(subSkillPath)) continue;
-          hasSkills = true;
-          const key = `${entry}/${sub}`;
-          const dstDir = resolve(brokerSkillsDir, entry, sub);
-          convertedSkills[key] = { ...collectSkill(key, subSkillPath, subDir, dstDir), _srcDir: srcDir, _dstDir: resolve(brokerSkillsDir, entry), _isNamespace: true };
-        }
-        if (!hasSkills) skippedSkills.push(`${entry} (no SKILL.md)`);
+    // Register all commands/*.md from a commands dir under a given key prefix
+    function registerCommands(keyPrefix, commandsDir) {
+      if (!existsSync(commandsDir)) return;
+      for (const file of readdirSync(commandsDir)) {
+        if (extname(file) !== ".md") continue;
+        const cmdName = basename(file, ".md");
+        const cmdKey = `${keyPrefix}:${cmdName}`;
+        converted[cmdKey] = commandEntry(cmdKey, resolve(commandsDir, file), { migratedFrom: label });
       }
     }
 
-    if (Object.keys(convertedSkills).length === 0 && skippedSkills.length === 0) {
+    for (const entry of readdirSync(skillsDir)) {
+      const entryPath = resolve(skillsDir, entry);
+      const lstat = lstatSync(entryPath);
+      if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
+
+      const skillPath = resolve(entryPath, "SKILL.md");
+      if (existsSync(skillPath)) {
+        // Flat skill with SKILL.md
+        converted[entry] = skillEntry(entry, skillPath, { migratedFrom: label });
+        registerCommands(entry, resolve(entryPath, "commands"));
+      } else {
+        // Check for namespaced skills (subdirs with SKILL.md)
+        let hasSkills = false;
+        for (const sub of readdirSync(entryPath)) {
+          const subPath = resolve(entryPath, sub);
+          const subLstat = lstatSync(subPath);
+          if (subLstat.isSymbolicLink() || !subLstat.isDirectory()) continue;
+          const subSkillPath = resolve(subPath, "SKILL.md");
+          if (!existsSync(subSkillPath)) continue;
+          hasSkills = true;
+          const key = `${entry}/${sub}`;
+          converted[key] = skillEntry(key, subSkillPath, { migratedFrom: label });
+          registerCommands(key, resolve(subPath, "commands"));
+        }
+
+        if (!hasSkills) {
+          // Commands-only package (e.g. skill.json + commands/ but no SKILL.md)
+          const commandsDir = resolve(entryPath, "commands");
+          if (existsSync(commandsDir) && readdirSync(commandsDir).some(f => extname(f) === ".md")) {
+            registerCommands(entry, commandsDir);
+          } else {
+            skipped.push(`${entry} (no SKILL.md)`);
+          }
+        }
+      }
+    }
+
+    if (Object.keys(converted).length === 0 && skipped.length === 0) {
       console.log(`\n⚠  No skills found in ${skillsDir} — skipping.`);
       continue;
     }
 
-    const addedSkills   = Object.keys(convertedSkills).filter(k => !existingSkills.skills[k]);
-    const updatedSkills = Object.keys(convertedSkills).filter(k =>  existingSkills.skills[k]);
-    Object.assign(existingSkills.skills, convertedSkills);
+    const added   = Object.keys(converted).filter(k => !existingSkills.skills[k]);
+    const updated = Object.keys(converted).filter(k =>  existingSkills.skills[k]);
+    Object.assign(existingSkills.skills, converted);
 
     console.log(`\nSkills source: ${skillsDir}`);
-    console.log(`Skills target: ${brokerSkillsDir}`);
-    if (addedSkills.length)   console.log(`Add:           ${addedSkills.join(", ")}`);
-    if (updatedSkills.length) console.log(`Update:        ${updatedSkills.join(", ")}`);
-    if (skippedSkills.length) console.log(`Skipped:       ${skippedSkills.join(", ")}`);
+    if (added.length)   console.log(`Add:           ${added.join(", ")}`);
+    if (updated.length) console.log(`Update:        ${updated.join(", ")}`);
+    if (skipped.length) console.log(`Skipped:       ${skipped.join(", ")}`);
 
     if (!dryRun) {
-      mkdirSync(brokerSkillsDir, { recursive: true });
-
       let splitCount = 0;
-      const movedSrcDirs = new Set();
-      for (const cfg of Object.values(convertedSkills)) {
-        const { _srcDir, _dstDir } = cfg;
-
-        // Move the source dir (namespace or flat skill) only once
-        if (!movedSrcDirs.has(_srcDir)) {
-          movedSrcDirs.add(_srcDir);
-          if (!existsSync(_dstDir)) {
-            renameSync(_srcDir, _dstDir);
-            symlinkSync(_dstDir, _srcDir);
-            console.log(`✓ Moved:    ${_srcDir} → ${_dstDir}`);
-          } else {
-            console.log(`  Exists:   ${_dstDir} (skipped move)`);
-          }
-        }
-
-        // Split SKILL.md into frontmatter stub + INSTRUCTIONS.md
-        const dstSkillPath = cfg.path;
-        const dstInstructions = dstSkillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
-        if (existsSync(dstSkillPath) && !existsSync(dstInstructions)) {
-          const content = readFileSync(dstSkillPath, "utf-8");
-          const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
-          if (match) {
-            const body = match[2].replace(/^\n+/, "");
-            if (body) {
-              writeFileSync(dstSkillPath, match[1]);
-              writeFileSync(dstInstructions, body);
-              splitCount++;
-              console.log(`✓ Split:    ${dstSkillPath}`);
-            }
-          }
+      for (const cfg of Object.values(converted)) {
+        if (!cfg.path.endsWith("SKILL.md")) continue;
+        if (splitSkillMd(cfg.path)) {
+          splitCount++;
+          console.log(`✓ Split:  ${cfg.path}`);
         }
       }
-      if (splitCount > 0) console.log(`✓ Split ${splitCount} skill(s) into SKILL.md stub + INSTRUCTIONS.md`);
-    }
-
-    // Strip internal move metadata before persisting
-    for (const cfg of Object.values(convertedSkills)) {
-      delete cfg._srcDir; delete cfg._dstDir; delete cfg._isNamespace;
+      if (splitCount > 0) console.log(`✓ Split ${splitCount} SKILL.md file(s)`);
     }
   }
 
@@ -441,6 +453,8 @@ if (migrateSkills) {
 }
 
 // ─── Plugins migration ─────────────────────────────────────────────────────
+// Plugins stay in ~/.claude/plugins/cache — only paths are registered.
+// SKILL.md files are split into stub + INSTRUCTIONS.md in-place.
 
 if (migratePlugins) {
   const pluginsCache = resolve(homedir(), ".claude", "plugins", "cache");
@@ -457,88 +471,72 @@ if (migratePlugins) {
       skillFiles = [];
     }
 
+    let commandsDirs;
+    try {
+      commandsDirs = execSync(`find "${pluginsCache}" -type d -name "commands" -maxdepth 6`, { encoding: "utf-8" })
+        .trim().split("\n").filter(Boolean);
+    } catch {
+      commandsDirs = [];
+    }
+
     let existingSkills = { skills: {} };
     if (existsSync(skillsOutPath)) {
       existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
     }
 
-    function parseFrontmatter(text) {
-      const m = text.match(/^---\n([\s\S]*?)\n---/);
-      if (!m) return {};
-      const result = {};
-      let key = null, multi = [];
-      for (const line of m[1].split("\n")) {
-        const kv = line.match(/^([\w-]+):\s*(.*)/);
-        if (kv) {
-          if (key && multi.length) result[key] = multi.join(" ").trim();
-          key = kv[1]; const val = kv[2].trim();
-          if (val && val !== ">") { result[key] = val; key = null; }
-          multi = [];
-        } else if (key && line.startsWith("  ")) {
-          multi.push(line.trim());
-        }
-      }
-      if (key && multi.length) result[key] = multi.join(" ").trim();
-      return result;
-    }
+    let splitCount = 0;
+    const converted = {};
 
-    let splitCount = 0, registered = 0;
-    const convertedPluginSkills = {};
-
+    // Register skills from SKILL.md files
     for (const skillPath of skillFiles) {
       const skillDir = dirname(skillPath);
       const skillName = basename(skillDir);
       const rel = relative(pluginsCache, skillDir).split("/");
       const pluginName = rel[1] ?? skillName;
-      const registryKey = `${pluginName}:${skillName}`;
-      const instructionsPath = skillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
+      const key = `${pluginName}:${skillName}`;
 
-      const content = readFileSync(skillPath, "utf-8");
-      const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
-      const fm = parseFrontmatter(content);
-      const description = fm.description ?? `Skill: ${skillName}`;
+      converted[key] = skillEntry(key, skillPath, { plugin: pluginName });
 
-      const words = new Set();
-      skillName.toLowerCase().split(/[-_]+/).filter(w => w.length > 2).forEach(w => words.add(w));
-      description.toLowerCase().split(/\W+/).filter(w => w.length > 4).forEach(w => words.add(w));
-      const keywords = [...words].slice(0, 12);
-
-      convertedPluginSkills[registryKey] = {
-        description,
-        keywords,
-        path: skillPath,
-        plugin: pluginName,
-      };
-
-      if (!dryRun && match) {
-        const body = match[2].replace(/^\n+/, "");
-        if (body && !existsSync(instructionsPath)) {
-          writeFileSync(skillPath, match[1]);
-          writeFileSync(instructionsPath, body);
-          splitCount++;
-        }
-      }
-      registered++;
+      if (!dryRun && splitSkillMd(skillPath)) splitCount++;
     }
 
-    const addedPluginSkills   = Object.keys(convertedPluginSkills).filter(k => !existingSkills.skills[k]);
-    const updatedPluginSkills = Object.keys(convertedPluginSkills).filter(k =>  existingSkills.skills[k]);
-    const mergedPluginSkills  = { skills: { ...existingSkills.skills, ...convertedPluginSkills } };
+    // Register commands from commands/ directories
+    // Skills (SKILL.md entries) take priority — don't overwrite with commands
+    for (const commandsDir of commandsDirs) {
+      const parentDir = dirname(commandsDir);
+      const rel = relative(pluginsCache, parentDir).split("/");
+      const pluginName = rel[1] ?? rel[0];
+      if (!pluginName) continue;
+
+      // Skip commands/ inside a skill subdir (those skill entries are already registered above)
+      if (existsSync(resolve(parentDir, "SKILL.md"))) continue;
+
+      for (const file of readdirSync(commandsDir)) {
+        if (extname(file) !== ".md") continue;
+        const cmdName = basename(file, ".md");
+        const key = `${pluginName}:${cmdName}`;
+        if (converted[key]) continue; // skill takes priority
+        converted[key] = commandEntry(key, resolve(commandsDir, file), { plugin: pluginName });
+      }
+    }
+
+    const added   = Object.keys(converted).filter(k => !existingSkills.skills[k]);
+    const updated = Object.keys(converted).filter(k =>  existingSkills.skills[k]);
+    const merged  = { skills: { ...existingSkills.skills, ...converted } };
 
     console.log(`\nPlugins cache: ${pluginsCache}`);
     console.log(`Skills out:    ${skillsOutPath}`);
-    console.log(`Skills found:  ${skillFiles.length}`);
-    if (addedPluginSkills.length)   console.log(`Add:           ${addedPluginSkills.length} skills`);
-    if (updatedPluginSkills.length) console.log(`Update:        ${updatedPluginSkills.length} skills`);
+    if (added.length)   console.log(`Add:           ${added.length} entries`);
+    if (updated.length) console.log(`Update:        ${updated.length} entries`);
 
     if (dryRun) {
       console.log("\n--- skills.json plugin entries (dry run) ---");
-      console.log(JSON.stringify(convertedPluginSkills, null, 2));
+      console.log(JSON.stringify(converted, null, 2));
       console.log("--- (not written) ---");
     } else {
       mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
-      writeFileSync(skillsOutPath, JSON.stringify(mergedPluginSkills, null, 2) + "\n");
-      console.log(`✓ Split:   ${splitCount} SKILL.md files`);
+      writeFileSync(skillsOutPath, JSON.stringify(merged, null, 2) + "\n");
+      if (splitCount > 0) console.log(`✓ Split:   ${splitCount} SKILL.md file(s)`);
       console.log(`✓ Written: ${skillsOutPath}`);
 
       // Install session-sync.mjs into ~/.config/context-broker/scripts/
