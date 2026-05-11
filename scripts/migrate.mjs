@@ -316,7 +316,7 @@ if (migrateSkills) {
 
     // Returns registry entries for a skill dir. key is the registry name (may include namespace),
     // srcDir is the actual directory to move, dstDir is where it lands in the broker.
-    function collectSkill(key, srcSkillPath, srcDir, dstDir) {
+    function collectSkill(key, srcSkillPath, _srcDir, dstDir) {
       const content = readFileSync(srcSkillPath, "utf-8");
       const firstLine = content.split("\n").find(l => l.match(/^[A-Z]/)) ?? "";
       const description = firstLine.slice(0, 120) || `Skill: ${key}`;
