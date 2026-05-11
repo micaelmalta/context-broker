@@ -35,7 +35,7 @@ export function detectShellSecretFile(): ShellSecretFile {
       path: filePath,
       format: (k, v) => `set -gx ${k} "${escapeFish(v)}"`,
       checkExisting: (content, k) =>
-        new RegExp(`^\\s*set\\s+-(g|U)x\\s+${escapeRegexKey(k)}(\\s|$)`, "m").test(content),
+        new RegExp(`^\\s*set\\s+-[gUx]+\\s+${escapeRegexKey(k)}(\\s|$)`, "m").test(content),
       label: "~/.config/fish/config.fish",
     };
   }
