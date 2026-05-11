@@ -119,13 +119,20 @@ function splitSkillMd(skillPath) {
 }
 
 // Build a registry entry from a SKILL.md path.
+// If the file has a frontmatter `description` field, it takes priority over the first prose line.
 function skillEntry(key, skillPath, extra = {}) {
   const content = readFileSync(skillPath, "utf-8");
-  const firstLine = content.split("\n").find(l => l.match(/^[A-Z]/)) ?? "";
-  const description = firstLine.slice(0, 120) || `Skill: ${key}`;
+  const fmMatch = content.match(/^---\n[\s\S]*?\n---/);
+  let fmDescription = null;
+  if (fmMatch) {
+    const descMatch = fmMatch[0].match(/^description:\s*(.+)$/m);
+    if (descMatch) fmDescription = descMatch[1].trim().replace(/^["']|["']$/g, "");
+  }
+  const firstLine = content.split("\n").find(l => l.match(/^[A-Za-z]/)) ?? "";
+  const description = (fmDescription ?? firstLine).slice(0, 120) || `Skill: ${key}`;
   const words = new Set();
   key.toLowerCase().split(/[-_/\s:]+/).forEach(w => w.length > 2 && words.add(w));
-  firstLine.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
+  description.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
   return { description, keywords: [...words], path: skillPath, ...extra };
 }
 
@@ -385,7 +392,8 @@ if (migrateSkills) {
         let hasSkills = false;
         for (const sub of readdirSync(entryPath)) {
           const subPath = resolve(entryPath, sub);
-          if (lstatSync(subPath).isSymbolicLink() || !lstatSync(subPath).isDirectory()) continue;
+          const subLstat = lstatSync(subPath);
+          if (subLstat.isSymbolicLink() || !subLstat.isDirectory()) continue;
           const subSkillPath = resolve(subPath, "SKILL.md");
           if (!existsSync(subSkillPath)) continue;
           hasSkills = true;
@@ -476,26 +484,6 @@ if (migratePlugins) {
       existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
     }
 
-    function parseFrontmatter(text) {
-      const m = text.match(/^---\n([\s\S]*?)\n---/);
-      if (!m) return {};
-      const result = {};
-      let key = null, multi = [];
-      for (const line of m[1].split("\n")) {
-        const kv = line.match(/^([\w-]+):\s*(.*)/);
-        if (kv) {
-          if (key && multi.length) result[key] = multi.join(" ").trim();
-          key = kv[1]; const val = kv[2].trim();
-          if (val && val !== ">") { result[key] = val; key = null; }
-          multi = [];
-        } else if (key && line.startsWith("  ")) {
-          multi.push(line.trim());
-        }
-      }
-      if (key && multi.length) result[key] = multi.join(" ").trim();
-      return result;
-    }
-
     let splitCount = 0;
     const converted = {};
 
@@ -507,19 +495,7 @@ if (migratePlugins) {
       const pluginName = rel[1] ?? skillName;
       const key = `${pluginName}:${skillName}`;
 
-      const content = readFileSync(skillPath, "utf-8");
-      const fm = parseFrontmatter(content);
-      const description = fm.description ?? `Skill: ${skillName}`;
-      const words = new Set();
-      skillName.toLowerCase().split(/[-_]+/).filter(w => w.length > 2).forEach(w => words.add(w));
-      description.toLowerCase().split(/\W+/).filter(w => w.length > 4).forEach(w => words.add(w));
-
-      converted[key] = {
-        description,
-        keywords: [...words].slice(0, 12),
-        path: skillPath,
-        plugin: pluginName,
-      };
+      converted[key] = skillEntry(key, skillPath, { plugin: pluginName });
 
       if (!dryRun && splitSkillMd(skillPath)) splitCount++;
     }
