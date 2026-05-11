@@ -29,14 +29,6 @@ import { fileURLToPath, pathToFileURL } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Guard: dist/migrate-helpers.js must exist (produced by `npm run build`)
-const _helpersPath = resolve(__dirname, "..", "dist", "migrate-helpers.js");
-if (!existsSync(_helpersPath)) {
-  console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
-  process.exit(1);
-}
-const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
-
 // ─── CLI args ──────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
@@ -116,6 +108,14 @@ function deriveKeywords(name, cfg) {
 // ─── Servers migration ─────────────────────────────────────────────────────
 
 if (migrateServers) {
+  // Guard: helpers are only needed for server migration (not --skills / --plugins)
+  const _helpersPath = resolve(__dirname, "..", "dist", "migrate-helpers.js");
+  if (!existsSync(_helpersPath)) {
+    console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
+    process.exit(1);
+  }
+  const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
+
   const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
   let existing = { servers: {} };
   if (existsSync(outPath)) existing = JSON.parse(readFileSync(outPath, "utf-8"));
@@ -232,7 +232,7 @@ if (migrateServers) {
     if (!dryRun) {
       // Append new secrets to the shell config file (fish or zsh/bash)
       if (newSecrets.length > 0) {
-        const block = `\n# MCP Broker secrets — migrated from ${label} (${new Date().toISOString().slice(0,10)})\n` +
+        const block = `\n# MCP Broker secrets — migrated from ${label.replace(/\n/g, " ")} (${new Date().toISOString().slice(0,10)})\n` +
           newSecrets.map(([k, v]) => shellSecretFile.format(k, v)).join("\n") + "\n";
         shellSecretContent += block;
         mkdirSync(dirname(shellSecretFile.path), { recursive: true });

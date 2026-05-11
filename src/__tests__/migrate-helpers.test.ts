@@ -38,6 +38,8 @@ describe("detectShellSecretFile", () => {
     expect(checkExisting("set -Ux MY_KEY value\n", "MY_KEY")).toBe(true);
     expect(checkExisting("set -xg MY_KEY value\n", "MY_KEY")).toBe(true);
     expect(checkExisting("set -xU MY_KEY value\n", "MY_KEY")).toBe(true);
+    expect(checkExisting("set -g -x MY_KEY value\n", "MY_KEY")).toBe(true);
+    expect(checkExisting("set --global --export MY_KEY value\n", "MY_KEY")).toBe(true);
     expect(checkExisting("# nothing here\n", "MY_KEY")).toBe(false);
   });
 
