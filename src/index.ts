@@ -15,9 +15,31 @@ import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { spawnSync } from "child_process";
 import { ToolRouter, ServerConfig } from "./router.js";
 import { ProcessManager } from "./process-manager.js";
 import { SkillRouter, SkillConfig } from "./skill-router.js";
+
+// ─── Subcommand dispatch ────────────────────────────────────────────────────
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const SUBCOMMANDS: Record<string, string> = {
+  migrate: resolve(__dirname, "../scripts/migrate.mjs"),
+  revert: resolve(__dirname, "../scripts/revert-migration.mjs"),
+  benchmark: resolve(__dirname, "../scripts/benchmark.mjs"),
+};
+
+const [, , subcommand, ...rest] = process.argv;
+if (subcommand && SUBCOMMANDS[subcommand]) {
+  const result = spawnSync(
+    process.execPath,
+    [SUBCOMMANDS[subcommand], ...rest],
+    { stdio: "inherit" }
+  );
+  process.exit(result.status ?? 1);
+}
 
 // ─── Config ────────────────────────────────────────────────────────────────
 

@@ -9,7 +9,8 @@
     },
     "files": [
         "dist",
-        "config"
+        "config",
+        "scripts"
     ],
     "repository": {
         "type": "git",
@@ -23,9 +24,9 @@
         "build": "tsc",
         "dev": "tsx src/index.ts",
         "start": "node dist/index.js",
-        "migrate": "node scripts/migrate.mjs",
-        "revert-migration": "node scripts/revert-migration.mjs",
-        "benchmark": "node scripts/benchmark.mjs",
+        "migrate": "node dist/index.js migrate",
+        "revert-migration": "node dist/index.js revert",
+        "benchmark": "node dist/index.js benchmark",
         "prepublishOnly": "npm run build",
         "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning node_modules/.bin/jest"
     },
