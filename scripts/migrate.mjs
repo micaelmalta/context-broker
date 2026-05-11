@@ -25,7 +25,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatS
 import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -35,7 +35,7 @@ if (!existsSync(_helpersPath)) {
   console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
   process.exit(1);
 }
-const { detectShellSecretFile, resolveBrokerEntry } = await import(_helpersPath);
+const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 

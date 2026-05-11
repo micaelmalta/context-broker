@@ -53,7 +53,10 @@ export function detectShellSecretFile(): ShellSecretFile {
 export function resolveBrokerEntry(distDir: string): BrokerEntry {
   try {
     const bin = execSync("which context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
-    if (bin) return { command: bin, args: [] };
+    // Reject npx shims — paths containing node_modules or _npx are temporary cache entries
+    if (bin && !bin.includes("node_modules") && !bin.includes("_npx")) {
+      return { command: bin, args: [] };
+    }
   } catch { /* not installed globally */ }
 
   const distPath = resolve(distDir, "index.js");

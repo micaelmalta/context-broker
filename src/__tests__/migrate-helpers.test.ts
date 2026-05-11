@@ -130,6 +130,20 @@ describe("resolveBrokerEntry", () => {
     expect(result.command).toBe("/usr/bin/context-broker");
   });
 
+  it("rejects npx shim returned by which (contains node_modules)", () => {
+    mockExecSyncFn.mockReturnValue("/home/user/.npm/_npx/abc/node_modules/.bin/context-broker\n");
+    mockExistsSyncFn.mockReturnValue(true);
+    const result = resolveBrokerEntry("/some/dist");
+    expect(result).toEqual({ command: "node", args: ["/some/dist/index.js"] });
+  });
+
+  it("rejects npx shim returned by which (contains _npx)", () => {
+    mockExecSyncFn.mockReturnValue("/tmp/.npm/_npx/context-broker\n");
+    mockExistsSyncFn.mockReturnValue(false);
+    const result = resolveBrokerEntry("/some/dist");
+    expect(result).toEqual({ command: "npx", args: ["-y", "context-broker"] });
+  });
+
   it("skips local dist when path is inside node_modules (npx run)", () => {
     mockExecSyncFn.mockImplementation(() => { throw new Error("not found"); });
     mockExistsSyncFn.mockReturnValue(true);
