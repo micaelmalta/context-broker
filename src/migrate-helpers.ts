@@ -20,7 +20,7 @@ function escapeRegexKey(k: string): string {
 }
 
 function escapeFish(v: string): string {
-  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$");
 }
 
 function escapeShell(v: string): string {
