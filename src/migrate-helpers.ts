@@ -1,0 +1,80 @@
+import { existsSync } from "fs";
+import { resolve } from "path";
+import { homedir } from "os";
+import { execSync } from "child_process";
+
+export interface ShellSecretFile {
+  path: string;
+  format: (key: string, value: string) => string;
+  checkExisting: (content: string, key: string) => boolean;
+  label: string;
+}
+
+export interface BrokerEntry {
+  command: string;
+  args: string[];
+}
+
+function escapeRegexKey(k: string): string {
+  return k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeFish(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$");
+}
+
+function escapeShell(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/"/g, '\\"').replace(/\$/g, "\\$");
+}
+
+export function detectShellSecretFile(): ShellSecretFile {
+  const shell = process.env.SHELL ?? "";
+  if (shell.endsWith("fish")) {
+    const filePath = resolve(homedir(), ".config", "fish", "config.fish");
+    return {
+      path: filePath,
+      format: (k, v) => `set -gx ${k} "${escapeFish(v)}"`,
+      checkExisting: (content, k) => {
+        const m = new RegExp(`^\\s*set\\s+((?:-[a-zA-Z-]+\\s+)*)${escapeRegexKey(k)}(\\s|$)`, "m").exec(content);
+        if (!m) return false;
+        // Parse flag tokens to check for export; avoid substring false-positives like --unexport
+        return m[1].trim().split(/\s+/).filter(Boolean).some(t => {
+          if (t.startsWith("--")) return t === "--export";
+          return t.startsWith("-") && t.includes("x");
+        });
+      },
+      label: "~/.config/fish/config.fish",
+    };
+  }
+  const isBash = shell.endsWith("bash");
+  const filePath = resolve(homedir(), isBash ? ".bashrc" : ".zshenv");
+  return {
+    path: filePath,
+    format: (k, v) => `export ${k}="${escapeShell(v)}"`,
+    checkExisting: (content, k) =>
+      new RegExp(`^\\s*export\\s+${escapeRegexKey(k)}=`, "m").test(content),
+    label: isBash ? "~/.bashrc" : "~/.zshenv",
+  };
+}
+
+export function resolveBrokerEntry(distDir: string): BrokerEntry {
+  try {
+    const bin = execSync("command -v context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
+    // Reject npx temp shims only — _npx is npm's cache dir for npx runs
+    // node_modules alone is valid (e.g. /usr/local/lib/node_modules/.bin/context-broker)
+    if (bin && !bin.split(/[\\/]/).includes("_npx")) {
+      return { command: bin, args: [] };
+    }
+  } catch { /* not installed globally */ }
+
+  const distPath = resolve(distDir, "index.js");
+  if (existsSync(distPath) && !distDir.split(/[\\/]/).includes("node_modules")) {
+    return { command: "node", args: [distPath] };
+  }
+
+  console.warn(
+    "  ⚠  context-broker binary not found — using npx fallback. " +
+    "Run `npm install -g context-broker` for a stable install."
+  );
+  return { command: "npx", args: ["-y", "context-broker"] };
+}

@@ -5,7 +5,9 @@
 // registers them in skills.json, and leaves symlinks so slash commands still work.
 // With --plugins, splits ~/.claude/plugins/cache/**/SKILL.md into stubs +
 // INSTRUCTIONS.md and registers all plugin skills in skills.json.
-// Detected secrets are extracted to ~/.zshenv and replaced with ${VAR} refs.
+// Detected secrets are extracted to the shell config file (~/.bashrc for bash,
+// ~/.zshenv for zsh, ~/.config/fish/config.fish for fish) and replaced with ${VAR} refs.
+// Requires: npm run build (produces dist/migrate-helpers.js)
 //
 // Usage:
 //   node scripts/migrate.mjs                        # auto-discovers all sources
@@ -23,7 +25,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatS
 import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -106,12 +108,20 @@ function deriveKeywords(name, cfg) {
 // ─── Servers migration ─────────────────────────────────────────────────────
 
 if (migrateServers) {
+  // Guard: helpers are only needed for server migration (not --skills / --plugins)
+  const _helpersPath = resolve(__dirname, "..", "dist", "migrate-helpers.js");
+  if (!existsSync(_helpersPath)) {
+    console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
+    process.exit(1);
+  }
+  const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
+
   const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
   let existing = { servers: {} };
   if (existsSync(outPath)) existing = JSON.parse(readFileSync(outPath, "utf-8"));
 
-  const zshenvPath = resolve(homedir(), ".zshenv");
-  let zshenvContent = existsSync(zshenvPath) ? readFileSync(zshenvPath, "utf-8") : "";
+  const shellSecretFile = detectShellSecretFile();
+  let shellSecretContent = existsSync(shellSecretFile.path) ? readFileSync(shellSecretFile.path, "utf-8") : "";
   const allSecrets = {};
 
   for (const { label, path: sourcePath } of resolveServerSources()) {
@@ -209,24 +219,25 @@ if (migrateServers) {
     Object.assign(allSecrets, secretsToWrite);
 
     const newSecrets = Object.entries(secretsToWrite)
-      .filter(([k]) => !zshenvContent.includes(`export ${k}=`));
+      .filter(([k]) => !shellSecretFile.checkExisting(shellSecretContent, k));
 
     console.log(`\nSource:  ${sourcePath}`);
     console.log(`Servers: ${Object.keys(mcpServers).length} found → ${Object.keys(converted).length} converted`);
     if (skipped.length)    console.log(`Skipped: ${skipped.join(", ")}`);
     if (added.length)      console.log(`Add:     ${added.join(", ")}`);
     if (updated.length)    console.log(`Update:  ${updated.join(", ")}`);
-    if (newSecrets.length) console.log(`Secrets: ${newSecrets.map(([k]) => k).join(", ")} → ~/.zshenv`);
-    else if (Object.keys(secretsToWrite).length > 0) console.log(`Secrets: all already present in ~/.zshenv`);
+    if (newSecrets.length) console.log(`Secrets: ${newSecrets.map(([k]) => k).join(", ")} → ${shellSecretFile.label}`);
+    else if (Object.keys(secretsToWrite).length > 0) console.log(`Secrets: all already present in ${shellSecretFile.label}`);
 
     if (!dryRun) {
-      // Append new secrets to ~/.zshenv
+      // Append new secrets to the shell config file (fish or zsh/bash)
       if (newSecrets.length > 0) {
-        const block = `\n# MCP Broker secrets — migrated from ${label} (${new Date().toISOString().slice(0,10)})\n` +
-          newSecrets.map(([k, v]) => `export ${k}="${v}"`).join("\n") + "\n";
-        zshenvContent += block;
-        writeFileSync(zshenvPath, zshenvContent);
-        console.log(`✓ Written: ${zshenvPath} (${newSecrets.length} secrets added)`);
+        const block = `\n# MCP Broker secrets — migrated from ${label.replace(/\n/g, " ")} (${new Date().toISOString().slice(0,10)})\n` +
+          newSecrets.map(([k, v]) => shellSecretFile.format(k, v)).join("\n") + "\n";
+        shellSecretContent += block;
+        mkdirSync(dirname(shellSecretFile.path), { recursive: true });
+        writeFileSync(shellSecretFile.path, shellSecretContent);
+        console.log(`✓ Written: ${shellSecretFile.path} (${newSecrets.length} secrets added)`);
       }
 
       // Remove migrated entries from source config so they don't load twice
@@ -272,10 +283,7 @@ if (migrateServers) {
 
   // ─── Register context-broker router in ~/.claude.json ───────────────────
   const claudeJsonPath = resolve(homedir(), ".claude.json");
-  const brokerEntry = {
-    command: "node",
-    args: [resolve(__dirname, "..", "dist", "index.js")],
-  };
+  const brokerEntry = resolveBrokerEntry(resolve(__dirname, "..", "dist"));
 
   if (dryRun) {
     console.log("\n--- ~/.claude.json broker entry (dry run) ---");

@@ -249,7 +249,7 @@ npx context-broker migrate --from claude --plugins
 - **Servers** — converts `{ command, args, env }` entries to broker format with `description`, `keywords`, and `autoActivate: false`; skips self-referential entries and HTTP/SSE servers
 - **Skills** — moves `~/.claude/skills/` into `~/.config/context-broker/skills/`, registers them in `skills.json`, and leaves a symlink so slash commands (`/loi`, `/loi-generate`, etc.) keep working
 - **Plugins** — registers all plugin skills from `~/.claude/plugins/cache/` in `skills.json`; adds a `SessionStart` hook to keep registrations fresh after plugin updates
-- **Secrets** — values matching `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD` are extracted to `~/.zshenv` and replaced with `${VAR}` references; already-present vars are not duplicated
+- **Secrets** — values matching `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD` are extracted to the appropriate shell config and replaced with `${VAR}` references; already-present vars are not duplicated. The destination is shell-aware: `~/.config/fish/config.fish` for fish, `~/.bashrc` for bash, `~/.zshenv` for zsh and others. Values are escaped to prevent shell interpolation.
 
 ### Undo a migration
 
