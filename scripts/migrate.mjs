@@ -1,25 +1,25 @@
 #!/usr/bin/env node
-// Migrates MCP server configs from Cursor, Claude Code, or OpenCode into
+// Migrates MCP server configs from Cursor, Claude Code, OpenCode, or Agents into
 // ~/.config/context-broker/servers.json.
-// With --skills, moves ~/.claude/skills/ into ~/.config/context-broker/skills/,
-// registers them in skills.json, and leaves a symlink in the source dir so
-// slash commands (/loi, /loi-generate, etc.) keep working.
+// Also moves skills directories into ~/.config/context-broker/skills/,
+// registers them in skills.json, and leaves symlinks so slash commands still work.
 // With --plugins, splits ~/.claude/plugins/cache/**/SKILL.md into stubs +
 // INSTRUCTIONS.md and registers all plugin skills in skills.json.
 // Detected secrets are extracted to ~/.zshenv and replaced with ${VAR} refs.
 //
 // Usage:
-//   node scripts/migrate.mjs --from cursor
+//   node scripts/migrate.mjs                        # auto-discovers all sources
+//   node scripts/migrate.mjs --from cursor          # restrict to one source
 //   node scripts/migrate.mjs --from claude
 //   node scripts/migrate.mjs --from opencode
+//   node scripts/migrate.mjs --from agents
 //   node scripts/migrate.mjs --from /path/to/file
-//   node scripts/migrate.mjs --from cursor --out /custom/servers.json
-//   node scripts/migrate.mjs --from claude --skills
-//   node scripts/migrate.mjs --from claude --skills --skills-out /custom/skills.json
-//   node scripts/migrate.mjs --from claude --plugins
-//   node scripts/migrate.mjs --from cursor --dry-run
+//   node scripts/migrate.mjs --out /custom/servers.json
+//   node scripts/migrate.mjs --skills-out /custom/skills.json
+//   node scripts/migrate.mjs --plugins
+//   node scripts/migrate.mjs --dry-run
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, lstatSync, renameSync, symlinkSync, copyFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatSync, renameSync, symlinkSync, copyFileSync } from "fs";
 import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -33,10 +33,10 @@ const args = process.argv.slice(2);
 const get = (flag) => { const i = args.indexOf(flag); return i !== -1 ? args[i + 1] : null; };
 const has = (flag) => args.includes(flag);
 
-const fromArg        = get("--from");
-const outArg         = get("--out");
-const skillsOutArg   = get("--skills-out");
-const dryRun         = has("--dry-run");
+const fromArg         = get("--from");
+const outArg          = get("--out");
+const skillsOutArg    = get("--skills-out");
+const dryRun          = has("--dry-run");
 const explicitSkills  = has("--skills");
 const explicitPlugins = has("--plugins");
 // Run everything by default unless specific flags are provided
@@ -44,25 +44,82 @@ const migrateServers = !explicitSkills && !explicitPlugins || has("--servers");
 const migrateSkills  = explicitSkills  || (!explicitPlugins && !has("--servers"));
 const migratePlugins = explicitPlugins || (!explicitSkills  && !has("--servers"));
 
-if (!fromArg) {
-  console.error("Usage: migrate.mjs --from <cursor|claude|opencode|/path/to/file> [--out <path>] [--dry-run]");
-  process.exit(1);
+// ─── Source registries ─────────────────────────────────────────────────────
+
+const SERVER_SOURCES = {
+  cursor:   resolve(homedir(), ".cursor", "mcp.json"),
+  claude:   resolve(homedir(), ".claude.json"),
+  opencode: resolve(homedir(), ".config", "opencode", "opencode.json"),
+};
+
+const SKILLS_SOURCES = {
+  claude:   resolve(homedir(), ".claude", "skills"),
+  cursor:   resolve(homedir(), ".cursor", "skills"),
+  opencode: resolve(homedir(), ".config", "opencode", "skills"),
+  agents:   resolve(homedir(), ".agents", "skills"),
+};
+
+// When --from is given, use just that source; otherwise discover all known ones.
+function resolveServerSources() {
+  if (fromArg) {
+    const path = SERVER_SOURCES[fromArg] ?? resolve(fromArg);
+    return [{ label: fromArg, path }];
+  }
+  return Object.entries(SERVER_SOURCES).map(([label, path]) => ({ label, path }));
+}
+
+function resolveSkillSources() {
+  if (fromArg) {
+    const path = SKILLS_SOURCES[fromArg] ?? resolve(fromArg, "skills");
+    return [{ label: fromArg, path }];
+  }
+  return Object.entries(SKILLS_SOURCES).map(([label, path]) => ({ label, path }));
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+const SECRET_KEY_RE = /(_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIAL|_DSN|_URI|_CERT|_PRIVATE)$/i;
+const SECRET_VAL_RE = /^(ATATT|ghp_|gho_|glpat-|sk-|xox[bpoas]-|ey[A-Za-z0-9])/;
+const MIN_SECRET_LEN = 20;
+
+function isSecret(key, value) {
+  if (typeof value !== "string") return false;
+  if (SECRET_KEY_RE.test(key)) return true;
+  if (value.length >= MIN_SECRET_LEN && SECRET_VAL_RE.test(value)) return true;
+  return false;
+}
+
+function deriveKeywords(name, cfg) {
+  const words = new Set();
+  name.toLowerCase().split(/[-_\s]+/).forEach(w => w.length > 2 && words.add(w));
+  const text = [cfg.command, ...(cfg.args ?? []), cfg.url ?? ""].join(" ").toLowerCase();
+  for (const kw of ["github", "jira", "confluence", "slack", "google", "aws",
+                    "mysql", "postgres", "sqlite", "redis", "fetch", "web",
+                    "search", "file", "git", "docker", "kubernetes", "eks",
+                    "langsmith", "datadog", "linear", "notion", "figma",
+                    "linkedin", "atlassian", "pagerduty"]) {
+    if (text.includes(kw)) words.add(kw);
+  }
+  return [...words];
 }
 
 // ─── Servers migration ─────────────────────────────────────────────────────
 
 if (migrateServers) {
-  const SOURCES = {
-    cursor:   resolve(homedir(), ".cursor", "mcp.json"),
-    claude:   resolve(homedir(), ".claude.json"),
-    opencode: resolve(homedir(), ".config", "opencode", "opencode.json"),
-  };
+  const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
+  let existing = { servers: {} };
+  if (existsSync(outPath)) existing = JSON.parse(readFileSync(outPath, "utf-8"));
 
-  const sourcePath = SOURCES[fromArg] ?? resolve(fromArg);
+  const zshenvPath = resolve(homedir(), ".zshenv");
+  let zshenvContent = existsSync(zshenvPath) ? readFileSync(zshenvPath, "utf-8") : "";
+  const allSecrets = {};
 
-  if (!existsSync(sourcePath)) {
-    console.log(`\n⚠  Server config not found: ${sourcePath} — skipping servers migration.`);
-  } else {
+  for (const { label, path: sourcePath } of resolveServerSources()) {
+    if (!existsSync(sourcePath)) {
+      console.log(`\n⚠  Server config not found: ${sourcePath} — skipping.`);
+      continue;
+    }
+
     const raw = JSON.parse(readFileSync(sourcePath, "utf-8"));
 
     let mcpServers = {};
@@ -84,8 +141,8 @@ if (migrateServers) {
         }
       }
     } else {
-      console.log(`\n⚠  Unrecognized server config format in ${sourcePath} — skipping servers migration.`);
-      mcpServers = null;
+      console.log(`\n⚠  Unrecognized server config format in ${sourcePath} — skipping.`);
+      continue;
     }
 
     // Also pull in HTTP servers from plugin .mcp.json files (e.g. Slack)
@@ -108,228 +165,216 @@ if (migrateServers) {
       }
     }
 
-    if (mcpServers && Object.keys(mcpServers).length > 0) {
-      const SECRET_KEY_RE = /(_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIAL|_DSN|_URI|_CERT|_PRIVATE)$/i;
-      const SECRET_VAL_RE = /^(ATATT|ghp_|gho_|glpat-|sk-|xox[bpoas]-|ey[A-Za-z0-9])/;
-      const MIN_SECRET_LEN = 20;
+    if (Object.keys(mcpServers).length === 0) continue;
 
-      function isSecret(key, value) {
-        if (typeof value !== "string") return false;
-        if (SECRET_KEY_RE.test(key)) return true;
-        if (value.length >= MIN_SECRET_LEN && SECRET_VAL_RE.test(value)) return true;
-        return false;
+    const SKIP = new Set(["router", "broker", "context-broker"]);
+    const converted = {}, skipped = [], secretsToWrite = {};
+
+    for (const [name, cfg] of Object.entries(mcpServers)) {
+      if (SKIP.has(name)) { skipped.push(name); continue; }
+      if (!cfg.command && !cfg.url) { console.warn(`  ⚠  Skipping "${name}" — no command or url`); skipped.push(name); continue; }
+
+      const env = {};
+      for (const [k, v] of Object.entries(cfg.env ?? {})) {
+        if (isSecret(k, v)) { secretsToWrite[k] = v; env[k] = `\${${k}}`; }
+        else env[k] = v;
       }
 
-      function deriveKeywords(name, cfg) {
-        const words = new Set();
-        name.toLowerCase().split(/[-_\s]+/).forEach(w => w.length > 2 && words.add(w));
-        const text = [cfg.command, ...(cfg.args ?? []), cfg.url ?? ""].join(" ").toLowerCase();
-        for (const kw of ["github", "jira", "confluence", "slack", "google", "aws",
-                          "mysql", "postgres", "sqlite", "redis", "fetch", "web",
-                          "search", "file", "git", "docker", "kubernetes", "eks",
-                          "langsmith", "datadog", "linear", "notion", "figma",
-                          "linkedin", "atlassian", "pagerduty"]) {
-          if (text.includes(kw)) words.add(kw);
-        }
-        return [...words];
-      }
-
-      const SKIP = new Set(["router", "broker", "context-broker"]);
-      const converted = {}, skipped = [], secretsToWrite = {};
-
-      for (const [name, cfg] of Object.entries(mcpServers)) {
-        if (SKIP.has(name)) { skipped.push(name); continue; }
-        if (!cfg.command && !cfg.url) { console.warn(`  ⚠  Skipping "${name}" — no command or url`); skipped.push(name); continue; }
-
-        const env = {};
-        for (const [k, v] of Object.entries(cfg.env ?? {})) {
-          if (isSecret(k, v)) { secretsToWrite[k] = v; env[k] = `\${${k}}`; }
-          else env[k] = v;
-        }
-
-        if (cfg.type === "http" || cfg.url) {
-          converted[name] = {
-            description:  `Migrated from ${fromArg}`,
-            keywords:     deriveKeywords(name, cfg),
-            type:         "http",
-            url:          cfg.url,
-            ...(cfg.oauth  ? { oauth: cfg.oauth }   : {}),
-            ...(cfg.headers ? { headers: cfg.headers } : {}),
-            ...(Object.keys(env).length > 0 ? { env } : {}),
-            autoActivate: false,
-          };
-        } else {
-          converted[name] = {
-            description:  `Migrated from ${fromArg}`,
-            keywords:     deriveKeywords(name, cfg),
-            command:      cfg.command,
-            args:         cfg.args ?? [],
-            ...(Object.keys(env).length > 0 ? { env } : {}),
-            autoActivate: false,
-          };
-        }
-      }
-
-      const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
-      let existing = { servers: {} };
-      if (existsSync(outPath)) existing = JSON.parse(readFileSync(outPath, "utf-8"));
-      const merged  = { servers: { ...existing.servers, ...converted } };
-      const added   = Object.keys(converted).filter(k => !existing.servers[k]);
-      const updated = Object.keys(converted).filter(k =>  existing.servers[k]);
-
-      const zshenvPath = resolve(homedir(), ".zshenv");
-      const zshenvExisting = existsSync(zshenvPath) ? readFileSync(zshenvPath, "utf-8") : "";
-      const newSecrets = Object.entries(secretsToWrite)
-        .filter(([k]) => !zshenvExisting.includes(`export ${k}=`));
-      const zshenvBlock = newSecrets.length > 0
-        ? `\n# MCP Broker secrets — migrated from ${fromArg} (${new Date().toISOString().slice(0,10)})\n` +
-          newSecrets.map(([k, v]) => `export ${k}="${v}"`).join("\n") + "\n"
-        : null;
-
-      console.log(`\nSource:  ${sourcePath}`);
-      console.log(`Output:  ${outPath}`);
-      console.log(`Servers: ${Object.keys(mcpServers).length} found → ${Object.keys(converted).length} converted`);
-      if (skipped.length)    console.log(`Skipped: ${skipped.join(", ")}`);
-      if (added.length)      console.log(`Add:     ${added.join(", ")}`);
-      if (updated.length)    console.log(`Update:  ${updated.join(", ")}`);
-      if (newSecrets.length) console.log(`Secrets: ${newSecrets.map(([k]) => k).join(", ")} → ~/.zshenv`);
-      else if (Object.keys(secretsToWrite).length > 0) console.log(`Secrets: all already present in ~/.zshenv`);
-
-      if (dryRun) {
-        console.log("\n--- servers.json (dry run) ---");
-        console.log(JSON.stringify(merged, null, 2));
-        if (zshenvBlock) { console.log("\n--- ~/.zshenv additions (dry run) ---"); console.log(zshenvBlock); }
-        console.log(`--- Would remove from ${sourcePath}: ${Object.keys(converted).join(", ")} ---`);
+      if (cfg.type === "http" || cfg.url) {
+        converted[name] = {
+          description:  `Migrated from ${label}`,
+          keywords:     deriveKeywords(name, cfg),
+          type:         "http",
+          url:          cfg.url,
+          ...(cfg.oauth   ? { oauth: cfg.oauth }     : {}),
+          ...(cfg.headers ? { headers: cfg.headers } : {}),
+          ...(Object.keys(env).length > 0 ? { env } : {}),
+          autoActivate: false,
+        };
       } else {
-        mkdirSync(resolve(outPath, ".."), { recursive: true });
-        writeFileSync(outPath, JSON.stringify(merged, null, 2) + "\n");
-        console.log(`\n✓ Written: ${outPath}`);
-        if (zshenvBlock) {
-          writeFileSync(zshenvPath, zshenvExisting + zshenvBlock);
-          console.log(`✓ Written: ${zshenvPath} (${newSecrets.length} secrets added)`);
+        converted[name] = {
+          description:  `Migrated from ${label}`,
+          keywords:     deriveKeywords(name, cfg),
+          command:      cfg.command,
+          args:         cfg.args ?? [],
+          ...(Object.keys(env).length > 0 ? { env } : {}),
+          autoActivate: false,
+        };
+      }
+    }
+
+    const added   = Object.keys(converted).filter(k => !existing.servers[k]);
+    const updated = Object.keys(converted).filter(k =>  existing.servers[k]);
+    Object.assign(existing.servers, converted);
+    Object.assign(allSecrets, secretsToWrite);
+
+    const newSecrets = Object.entries(secretsToWrite)
+      .filter(([k]) => !zshenvContent.includes(`export ${k}=`));
+
+    console.log(`\nSource:  ${sourcePath}`);
+    console.log(`Servers: ${Object.keys(mcpServers).length} found → ${Object.keys(converted).length} converted`);
+    if (skipped.length)    console.log(`Skipped: ${skipped.join(", ")}`);
+    if (added.length)      console.log(`Add:     ${added.join(", ")}`);
+    if (updated.length)    console.log(`Update:  ${updated.join(", ")}`);
+    if (newSecrets.length) console.log(`Secrets: ${newSecrets.map(([k]) => k).join(", ")} → ~/.zshenv`);
+    else if (Object.keys(secretsToWrite).length > 0) console.log(`Secrets: all already present in ~/.zshenv`);
+
+    if (!dryRun) {
+      // Append new secrets to ~/.zshenv
+      if (newSecrets.length > 0) {
+        const block = `\n# MCP Broker secrets — migrated from ${label} (${new Date().toISOString().slice(0,10)})\n` +
+          newSecrets.map(([k, v]) => `export ${k}="${v}"`).join("\n") + "\n";
+        zshenvContent += block;
+        writeFileSync(zshenvPath, zshenvContent);
+        console.log(`✓ Written: ${zshenvPath} (${newSecrets.length} secrets added)`);
+      }
+
+      // Remove migrated entries from source config so they don't load twice
+      const migratedNames = new Set(Object.keys(converted));
+      const remaining = Object.fromEntries(
+        Object.entries(raw.mcpServers ?? raw.mcp ?? {}).filter(([n]) => !migratedNames.has(n))
+      );
+      if (raw.mcpServers) raw.mcpServers = remaining;
+      else if (raw.mcp) raw.mcp = remaining;
+      writeFileSync(sourcePath, JSON.stringify(raw, null, 2) + "\n");
+      console.log(`✓ Removed ${migratedNames.size} entries from ${sourcePath}`);
+
+      // Disable plugins whose MCP server was migrated (avoids double-loading)
+      const settingsPath = resolve(homedir(), ".claude", "settings.json");
+      if (existsSync(settingsPath)) {
+        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+        const plugins = settings.enabledPlugins ?? {};
+        let disabledCount = 0;
+        for (const pluginKey of Object.keys(plugins)) {
+          const pluginName = pluginKey.split("@")[0];
+          if (migratedNames.has(pluginName) && plugins[pluginKey] === true) {
+            plugins[pluginKey] = false;
+            disabledCount++;
+          }
         }
-
-        // Remove migrated entries from source config so they don't load twice
-        const migratedNames = new Set(Object.keys(converted));
-        const remaining = Object.fromEntries(
-          Object.entries(raw.mcpServers ?? raw.mcp ?? {}).filter(([n]) => !migratedNames.has(n))
-        );
-        if (raw.mcpServers) raw.mcpServers = remaining;
-        else if (raw.mcp) raw.mcp = remaining;
-        writeFileSync(sourcePath, JSON.stringify(raw, null, 2) + "\n");
-        console.log(`✓ Removed ${migratedNames.size} entries from ${sourcePath}`);
-
-        // Disable plugins whose MCP server was migrated (avoids double-loading)
-        const settingsPath = resolve(homedir(), ".claude", "settings.json");
-        if (existsSync(settingsPath)) {
-          const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-          const plugins = settings.enabledPlugins ?? {};
-          let disabledCount = 0;
-          for (const pluginKey of Object.keys(plugins)) {
-            const pluginName = pluginKey.split("@")[0];
-            if (migratedNames.has(pluginName) && plugins[pluginKey] === true) {
-              plugins[pluginKey] = false;
-              disabledCount++;
-            }
-          }
-          if (disabledCount > 0) {
-            writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-            console.log(`✓ Disabled ${disabledCount} plugin(s) in ${settingsPath}`);
-          }
+        if (disabledCount > 0) {
+          writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+          console.log(`✓ Disabled ${disabledCount} plugin(s) in ${settingsPath}`);
         }
       }
     }
+  }
+
+  if (dryRun) {
+    console.log("\n--- servers.json (dry run) ---");
+    console.log(JSON.stringify(existing, null, 2));
+    console.log("--- (not written) ---");
+  } else {
+    mkdirSync(resolve(outPath, ".."), { recursive: true });
+    writeFileSync(outPath, JSON.stringify(existing, null, 2) + "\n");
+    console.log(`\n✓ Written: ${outPath}`);
   }
 }
 
 // ─── Skills migration ──────────────────────────────────────────────────────
 
 if (migrateSkills) {
-  const SKILLS_SOURCES = {
-    claude:   resolve(homedir(), ".claude", "skills"),
-    cursor:   resolve(homedir(), ".cursor", "skills"),
-    opencode: resolve(homedir(), ".config", "opencode", "skills"),
-  };
-
-  const skillsDir = SKILLS_SOURCES[fromArg] ?? resolve(fromArg, "skills");
   const brokerSkillsDir = resolve(homedir(), ".config", "context-broker", "skills");
+  const skillsOutPath = skillsOutArg ?? resolve(homedir(), ".config", "context-broker", "skills.json");
 
-  if (!existsSync(skillsDir)) {
-    console.log(`\n⚠  Skills directory not found: ${skillsDir} — skipping skills migration.`);
-  } else {
-    const skillsOutPath = skillsOutArg
-      ?? resolve(homedir(), ".config", "context-broker", "skills.json");
+  let existingSkills = { skills: {} };
+  if (existsSync(skillsOutPath)) {
+    existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
+  }
 
-    let existingSkills = { skills: {} };
-    if (existsSync(skillsOutPath)) {
-      existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
+  for (const { label, path: skillsDir } of resolveSkillSources()) {
+    if (!existsSync(skillsDir)) {
+      console.log(`\n⚠  Skills directory not found: ${skillsDir} — skipping.`);
+      continue;
     }
 
     const convertedSkills = {};
     const skippedSkills = [];
+
+    // Returns registry entries for a skill dir. key is the registry name (may include namespace),
+    // srcDir is the actual directory to move, dstDir is where it lands in the broker.
+    function collectSkill(key, srcSkillPath, srcDir, dstDir) {
+      const content = readFileSync(srcSkillPath, "utf-8");
+      const firstLine = content.split("\n").find(l => l.match(/^[A-Z]/)) ?? "";
+      const description = firstLine.slice(0, 120) || `Skill: ${key}`;
+      const words = new Set();
+      key.toLowerCase().split(/[-_/\s]+/).forEach(w => w.length > 2 && words.add(w));
+      firstLine.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
+      return {
+        description,
+        keywords: [...words],
+        path: resolve(dstDir, "SKILL.md"),
+        migratedFrom: label,
+      };
+    }
 
     for (const entry of readdirSync(skillsDir)) {
       const srcDir = resolve(skillsDir, entry);
       const lstat = lstatSync(srcDir);
       // skip non-directories and already-migrated symlinks
       if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
-      const skillPath = resolve(brokerSkillsDir, entry, "SKILL.md");
+
       const srcSkillPath = resolve(srcDir, "SKILL.md");
-      if (!existsSync(srcSkillPath)) {
-        skippedSkills.push(`${entry} (no SKILL.md)`);
-        continue;
+      if (existsSync(srcSkillPath)) {
+        // flat skill at top level
+        const dstDir = resolve(brokerSkillsDir, entry);
+        convertedSkills[entry] = { ...collectSkill(entry, srcSkillPath, srcDir, dstDir), _srcDir: srcDir, _dstDir: dstDir };
+      } else {
+        // check for namespace: subdirs containing SKILL.md
+        let hasSkills = false;
+        for (const sub of readdirSync(srcDir)) {
+          const subDir = resolve(srcDir, sub);
+          const subLstat = lstatSync(subDir);
+          if (subLstat.isSymbolicLink() || !subLstat.isDirectory()) continue;
+          const subSkillPath = resolve(subDir, "SKILL.md");
+          if (!existsSync(subSkillPath)) continue;
+          hasSkills = true;
+          const key = `${entry}/${sub}`;
+          const dstDir = resolve(brokerSkillsDir, entry, sub);
+          convertedSkills[key] = { ...collectSkill(key, subSkillPath, subDir, dstDir), _srcDir: srcDir, _dstDir: resolve(brokerSkillsDir, entry), _isNamespace: true };
+        }
+        if (!hasSkills) skippedSkills.push(`${entry} (no SKILL.md)`);
       }
-
-      const content = readFileSync(srcSkillPath, "utf-8");
-      const firstLine = content.split("\n").find(l => l.match(/^[A-Z]/)) ?? "";
-      const description = firstLine.slice(0, 120) || `Skill: ${entry}`;
-
-      const words = new Set();
-      entry.toLowerCase().split(/[-_\s]+/).forEach(w => w.length > 2 && words.add(w));
-      firstLine.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
-
-      convertedSkills[entry] = {
-        description,
-        keywords: [...words],
-        path: skillPath,
-        migratedFrom: fromArg,
-      };
     }
 
-    const mergedSkills = { skills: { ...existingSkills.skills, ...convertedSkills } };
+    if (Object.keys(convertedSkills).length === 0 && skippedSkills.length === 0) {
+      console.log(`\n⚠  No skills found in ${skillsDir} — skipping.`);
+      continue;
+    }
+
     const addedSkills   = Object.keys(convertedSkills).filter(k => !existingSkills.skills[k]);
     const updatedSkills = Object.keys(convertedSkills).filter(k =>  existingSkills.skills[k]);
+    Object.assign(existingSkills.skills, convertedSkills);
 
     console.log(`\nSkills source: ${skillsDir}`);
     console.log(`Skills target: ${brokerSkillsDir}`);
-    console.log(`Skills out:    ${skillsOutPath}`);
     if (addedSkills.length)   console.log(`Add:           ${addedSkills.join(", ")}`);
     if (updatedSkills.length) console.log(`Update:        ${updatedSkills.join(", ")}`);
     if (skippedSkills.length) console.log(`Skipped:       ${skippedSkills.join(", ")}`);
 
-    if (dryRun) {
-      console.log("\n--- skills.json (dry run) ---");
-      console.log(JSON.stringify(mergedSkills, null, 2));
-      console.log("--- (not written) ---");
-    } else {
+    if (!dryRun) {
       mkdirSync(brokerSkillsDir, { recursive: true });
-      mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
 
       let splitCount = 0;
-      for (const entry of Object.keys(convertedSkills)) {
-        const src = resolve(skillsDir, entry);
-        const dst = resolve(brokerSkillsDir, entry);
-        if (!existsSync(dst)) {
-          renameSync(src, dst);               // move to broker dir
-          symlinkSync(dst, src);              // leave symlink so /skill-name still works
-          console.log(`✓ Moved:    ${src} → ${dst}`);
-        } else {
-          console.log(`  Exists:   ${dst} (skipped move)`);
+      const movedSrcDirs = new Set();
+      for (const cfg of Object.values(convertedSkills)) {
+        const { _srcDir, _dstDir } = cfg;
+
+        // Move the source dir (namespace or flat skill) only once
+        if (!movedSrcDirs.has(_srcDir)) {
+          movedSrcDirs.add(_srcDir);
+          if (!existsSync(_dstDir)) {
+            renameSync(_srcDir, _dstDir);
+            symlinkSync(_dstDir, _srcDir);
+            console.log(`✓ Moved:    ${_srcDir} → ${_dstDir}`);
+          } else {
+            console.log(`  Exists:   ${_dstDir} (skipped move)`);
+          }
         }
 
         // Split SKILL.md into frontmatter stub + INSTRUCTIONS.md
-        const dstSkillPath = resolve(dst, "SKILL.md");
-        const dstInstructions = resolve(dst, "INSTRUCTIONS.md");
+        const dstSkillPath = cfg.path;
+        const dstInstructions = dstSkillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
         if (existsSync(dstSkillPath) && !existsSync(dstInstructions)) {
           const content = readFileSync(dstSkillPath, "utf-8");
           const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
@@ -345,10 +390,22 @@ if (migrateSkills) {
         }
       }
       if (splitCount > 0) console.log(`✓ Split ${splitCount} skill(s) into SKILL.md stub + INSTRUCTIONS.md`);
-
-      writeFileSync(skillsOutPath, JSON.stringify(mergedSkills, null, 2) + "\n");
-      console.log(`✓ Written: ${skillsOutPath}`);
     }
+
+    // Strip internal move metadata before persisting
+    for (const cfg of Object.values(convertedSkills)) {
+      delete cfg._srcDir; delete cfg._dstDir; delete cfg._isNamespace;
+    }
+  }
+
+  if (dryRun) {
+    console.log("\n--- skills.json (dry run) ---");
+    console.log(JSON.stringify(existingSkills, null, 2));
+    console.log("--- (not written) ---");
+  } else {
+    mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
+    writeFileSync(skillsOutPath, JSON.stringify(existingSkills, null, 2) + "\n");
+    console.log(`✓ Written: ${skillsOutPath}`);
   }
 }
 

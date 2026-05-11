@@ -2,22 +2,23 @@
 // Reverts a previous `migrate.mjs` run:
 //   - Removes entries from ~/.config/context-broker/servers.json whose description
 //     matches "Migrated from <source>" (the marker migrate.mjs stamps on each entry)
-//   - With --skills, also removes entries from ~/.config/context-broker/skills.json
-//     whose migratedFrom field matches <source>
+//   - Removes entries from ~/.config/context-broker/skills.json whose migratedFrom
+//     field matches a known source, and moves skill dirs back with INSTRUCTIONS.md merged
 //   - With --plugins, removes all plugin entries from skills.json and restores
 //     SKILL.md files from their INSTRUCTIONS.md sibling
 //   - Removes the corresponding secret block from ~/.zshenv
 //
 // Usage:
-//   node scripts/revert-migration.mjs --from cursor
+//   node scripts/revert-migration.mjs                        # reverts all sources
+//   node scripts/revert-migration.mjs --from cursor          # restrict to one source
 //   node scripts/revert-migration.mjs --from claude
 //   node scripts/revert-migration.mjs --from opencode
+//   node scripts/revert-migration.mjs --from agents
 //   node scripts/revert-migration.mjs --from /path/to/file   (uses the basename as marker)
-//   node scripts/revert-migration.mjs --config /custom/servers.json --from cursor
-//   node scripts/revert-migration.mjs --from claude --skills
-//   node scripts/revert-migration.mjs --from claude --skills --skills-config /custom/skills.json
-//   node scripts/revert-migration.mjs --from claude --plugins
-//   node scripts/revert-migration.mjs --from cursor --dry-run
+//   node scripts/revert-migration.mjs --config /custom/servers.json
+//   node scripts/revert-migration.mjs --skills-config /custom/skills.json
+//   node scripts/revert-migration.mjs --plugins
+//   node scripts/revert-migration.mjs --dry-run
 
 import { readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, lstatSync } from "fs";
 import { resolve, basename } from "path";
@@ -40,29 +41,30 @@ const revertServers   = !explicitSkills && !explicitPlugins || has("--servers");
 const revertSkills    = explicitSkills  || (!explicitPlugins && !has("--servers"));
 const revertPlugins   = explicitPlugins || (!explicitSkills  && !has("--servers"));
 
-if (!fromArg) {
-  console.error("Usage: revert-migration.mjs --from <cursor|claude|opencode|/path/to/file> [--config <path>] [--dry-run]");
-  process.exit(1);
+// ─── Source registries ─────────────────────────────────────────────────────
+
+const SERVER_SOURCES = {
+  cursor:   resolve(homedir(), ".cursor", "mcp.json"),
+  claude:   resolve(homedir(), ".claude.json"),
+  opencode: resolve(homedir(), ".config", "opencode", "opencode.json"),
+};
+
+const SKILLS_SOURCES = {
+  claude:   resolve(homedir(), ".claude", "skills"),
+  cursor:   resolve(homedir(), ".cursor", "skills"),
+  opencode: resolve(homedir(), ".config", "opencode", "skills"),
+  agents:   resolve(homedir(), ".agents", "skills"),
+};
+
+function resolveLabels() {
+  if (fromArg) return [fromArg];
+  return Object.keys({ ...SERVER_SOURCES, ...SKILLS_SOURCES })
+    .filter((v, i, a) => a.indexOf(v) === i); // unique
 }
-
-function escapeRe(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-const migrationLabel = fromArg;
-
-console.log(`\nSource label: "${migrationLabel}"`);
 
 // ─── Servers revert ────────────────────────────────────────────────────────
 
 if (revertServers) {
-  const SOURCES = {
-    cursor:   resolve(homedir(), ".cursor", "mcp.json"),
-    claude:   resolve(homedir(), ".claude.json"),
-    opencode: resolve(homedir(), ".config", "opencode", "opencode.json"),
-  };
-  const sourcePath = SOURCES[migrationLabel] ?? resolve(migrationLabel);
-
   const serversPath = configArg
     ? resolve(configArg)
     : resolve(homedir(), ".config", "context-broker", "servers.json");
@@ -70,62 +72,84 @@ if (revertServers) {
   if (!existsSync(serversPath)) {
     console.log(`\n⚠  servers.json not found: ${serversPath} — skipping servers revert.`);
   } else {
-    const servers = JSON.parse(readFileSync(serversPath, "utf-8")).servers ?? {};
+    const allServers = JSON.parse(readFileSync(serversPath, "utf-8")).servers ?? {};
 
-    if (Object.keys(servers).length === 0) {
+    if (Object.keys(allServers).length === 0) {
       console.log(`\nServers: servers.json is empty — nothing to revert.`);
     } else {
-      // Reconstruct mcpServers entries from servers.json
-      const mcpServers = {};
-      for (const [name, cfg] of Object.entries(servers)) {
-        if (cfg.type === "http" || cfg.url) {
-          const entry = { type: "http", url: cfg.url };
-          if (cfg.oauth)   entry.oauth   = cfg.oauth;
-          if (cfg.headers) entry.headers = cfg.headers;
-          if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
-          mcpServers[name] = entry;
+      const labels = resolveLabels();
+
+      for (const label of labels) {
+        const sourcePath = SERVER_SOURCES[label] ?? resolve(label);
+        const toRestore = Object.entries(allServers)
+          .filter(([, cfg]) => cfg.description === `Migrated from ${label}`);
+
+        if (toRestore.length === 0) {
+          console.log(`\nServers (${label}): no entries with that migration label — skipping.`);
+          continue;
+        }
+
+        const mcpServers = {};
+        for (const [name, cfg] of toRestore) {
+          if (cfg.type === "http" || cfg.url) {
+            const entry = { type: "http", url: cfg.url };
+            if (cfg.oauth)   entry.oauth   = cfg.oauth;
+            if (cfg.headers) entry.headers = cfg.headers;
+            if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
+            mcpServers[name] = entry;
+          } else {
+            const entry = { command: cfg.command, args: cfg.args ?? [] };
+            if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
+            mcpServers[name] = entry;
+          }
+          delete allServers[name];
+        }
+
+        console.log(`\nServers (${label}): restoring ${Object.keys(mcpServers).length} entries to ${sourcePath}`);
+
+        if (dryRun) {
+          console.log(JSON.stringify({ mcpServers }, null, 2));
         } else {
-          const entry = { command: cfg.command, args: cfg.args ?? [] };
-          if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
-          mcpServers[name] = entry;
+          const sourceRaw = existsSync(sourcePath) ? JSON.parse(readFileSync(sourcePath, "utf-8")) : {};
+          sourceRaw.mcpServers = { ...(sourceRaw.mcpServers ?? {}), ...mcpServers };
+          writeFileSync(sourcePath, JSON.stringify(sourceRaw, null, 2) + "\n");
+          console.log(`✓ Written: ${sourcePath}`);
+
+          // Re-enable plugins that were disabled during migration
+          const settingsPath = resolve(homedir(), ".claude", "settings.json");
+          if (existsSync(settingsPath)) {
+            const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+            const plugins = settings.enabledPlugins ?? {};
+            const httpNames = new Set(
+              Object.entries(mcpServers)
+                .filter(([, cfg]) => cfg.type === "http" || cfg.url)
+                .map(([name]) => name)
+            );
+            let enabledCount = 0;
+            for (const pluginKey of Object.keys(plugins)) {
+              const pluginName = pluginKey.split("@")[0];
+              if (httpNames.has(pluginName) && plugins[pluginKey] === false) {
+                plugins[pluginKey] = true;
+                enabledCount++;
+              }
+            }
+            if (enabledCount > 0) {
+              writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+              console.log(`✓ Re-enabled ${enabledCount} plugin(s) in ${settingsPath}`);
+            }
+          }
         }
       }
 
-      console.log(`\nServers to restore to ${sourcePath} (${Object.keys(mcpServers).length}): ${Object.keys(mcpServers).join(", ")}`);
-
-      if (dryRun) {
-        console.log("\n--- mcpServers to add (dry run) ---");
-        console.log(JSON.stringify({ mcpServers }, null, 2));
-        console.log("--- (not written) ---");
+      if (!dryRun) {
+        const serversFile = JSON.parse(readFileSync(serversPath, "utf-8"));
+        serversFile.servers = allServers;
+        writeFileSync(serversPath, JSON.stringify(serversFile, null, 2) + "\n");
+        console.log(`✓ Updated: ${serversPath}`);
       } else {
-        const sourceRaw = existsSync(sourcePath) ? JSON.parse(readFileSync(sourcePath, "utf-8")) : {};
-        sourceRaw.mcpServers = { ...(sourceRaw.mcpServers ?? {}), ...mcpServers };
-        writeFileSync(sourcePath, JSON.stringify(sourceRaw, null, 2) + "\n");
-        console.log(`\n✓ Written: ${sourcePath}`);
-
-        // Re-enable plugins that were disabled during migration
-        const settingsPath = resolve(homedir(), ".claude", "settings.json");
-        if (existsSync(settingsPath)) {
-          const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-          const plugins = settings.enabledPlugins ?? {};
-          const httpNames = new Set(
-            Object.entries(servers)
-              .filter(([, cfg]) => cfg.type === "http" || cfg.url)
-              .map(([name]) => name)
-          );
-          let enabledCount = 0;
-          for (const pluginKey of Object.keys(plugins)) {
-            const pluginName = pluginKey.split("@")[0];
-            if (httpNames.has(pluginName) && plugins[pluginKey] === false) {
-              plugins[pluginKey] = true;
-              enabledCount++;
-            }
-          }
-          if (enabledCount > 0) {
-            writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-            console.log(`✓ Re-enabled ${enabledCount} plugin(s) in ${settingsPath}`);
-          }
-        }
+        console.log("\n--- servers.json after revert (dry run) ---");
+        console.log(JSON.stringify({ servers: allServers }, null, 2));
+        console.log("--- (not written) ---");
       }
     }
   }
@@ -143,71 +167,82 @@ if (revertSkills) {
   } else {
     const skillsFile = JSON.parse(readFileSync(skillsPath, "utf-8"));
     const skills = skillsFile.skills ?? {};
+    const brokerSkillsDir = resolve(homedir(), ".config", "context-broker", "skills");
+    const labels = resolveLabels();
 
-    const skillsToRemove = Object.entries(skills)
-      .filter(([, cfg]) => cfg.migratedFrom === migrationLabel)
-      .map(([name]) => name);
+    let anyFound = false;
 
-    if (skillsToRemove.length === 0) {
-      console.log(`\nSkills: no entries with migratedFrom "${migrationLabel}" found — nothing to revert.`);
-    } else {
-      const remainingSkills = Object.fromEntries(
-        Object.entries(skills).filter(([name]) => !skillsToRemove.includes(name))
-      );
+    for (const label of labels) {
+      const skillsDir = SKILLS_SOURCES[label] ?? resolve(label, "skills");
+      const skillsToRemove = Object.entries(skills)
+        .filter(([, cfg]) => cfg.migratedFrom === label)
+        .map(([name]) => name);
 
-      console.log(`\nSkill entries to remove (${skillsToRemove.length}): ${skillsToRemove.join(", ")}`);
+      if (skillsToRemove.length === 0) continue;
+      anyFound = true;
 
-      const SKILLS_SOURCES = {
-        claude:   resolve(homedir(), ".claude", "skills"),
-        cursor:   resolve(homedir(), ".cursor", "skills"),
-        opencode: resolve(homedir(), ".config", "opencode", "skills"),
-      };
-      const skillsDir = SKILLS_SOURCES[migrationLabel] ?? resolve(migrationLabel, "skills");
-      const brokerSkillsDir = resolve(homedir(), ".config", "context-broker", "skills");
+      console.log(`\nSkills (${label}): removing ${skillsToRemove.length} entries, restoring to ${skillsDir}`);
+
+      // Group by the top-level broker dir to move (namespace dirs move as a unit)
+      // name may be "skill" (flat) or "namespace/skill" (nested)
+      const brokerDirsToMove = new Map(); // brokerTopDir -> srcTopDir
+      for (const name of skillsToRemove) {
+        const parts = name.split("/");
+        const topLevel = parts[0];
+        brokerDirsToMove.set(resolve(brokerSkillsDir, topLevel), resolve(skillsDir, topLevel));
+      }
 
       if (dryRun) {
         for (const name of skillsToRemove) {
-          const brokerDir = resolve(brokerSkillsDir, name);
-          const instructionsPath = resolve(brokerDir, "INSTRUCTIONS.md");
-          const symlink = resolve(skillsDir, name);
-          const isSymlink = existsSync(symlink) && lstatSync(symlink).isSymbolicLink();
-          console.log(`  ${name}: merge INSTRUCTIONS.md → SKILL.md, move ${brokerDir} → ${skillsDir}/${name}${isSymlink ? " (remove symlink)" : ""}`);
+          const skillDir = resolve(brokerSkillsDir, ...name.split("/"));
+          const instructionsPath = resolve(skillDir, "INSTRUCTIONS.md");
+          console.log(`  ${name}: ${existsSync(instructionsPath) ? "merge INSTRUCTIONS.md → SKILL.md, " : ""}move to ${skillsDir}/${name.split("/")[0]}`);
         }
-        console.log("\n--- skills.json after revert (dry run) ---");
-        console.log(JSON.stringify({ skills: remainingSkills }, null, 2));
-        console.log("--- (not written) ---");
+        for (const [brokerTop, srcTop] of brokerDirsToMove) {
+          let symlinkNote = "";
+          try { if (lstatSync(srcTop).isSymbolicLink()) symlinkNote = " (remove symlink)"; } catch {}
+          console.log(`  move ${brokerTop} → ${srcTop}${symlinkNote}`);
+        }
       } else {
-        let mergedCount = 0, movedCount = 0;
+        // First merge all INSTRUCTIONS.md back into SKILL.md
+        let mergedCount = 0;
         for (const name of skillsToRemove) {
-          const brokerDir = resolve(brokerSkillsDir, name);
-          const instructionsPath = resolve(brokerDir, "INSTRUCTIONS.md");
-          const skillMdPath = resolve(brokerDir, "SKILL.md");
-          const symlinkPath = resolve(skillsDir, name);
-
-          // Merge INSTRUCTIONS.md back into SKILL.md
+          const skillDir = resolve(brokerSkillsDir, ...name.split("/"));
+          const instructionsPath = resolve(skillDir, "INSTRUCTIONS.md");
+          const skillMdPath = resolve(skillDir, "SKILL.md");
           if (existsSync(instructionsPath) && existsSync(skillMdPath)) {
             const stub = readFileSync(skillMdPath, "utf-8");
             const body = readFileSync(instructionsPath, "utf-8");
-            const stubNormalized = stub.endsWith("\n") ? stub : stub + "\n";
-            writeFileSync(skillMdPath, stubNormalized + "\n" + body);
+            writeFileSync(skillMdPath, (stub.endsWith("\n") ? stub : stub + "\n") + "\n" + body);
             unlinkSync(instructionsPath);
             mergedCount++;
           }
+          delete skills[name];
+        }
 
-          // Remove symlink (use lstatSync — existsSync follows links and misses dangling ones)
-          try {
-            if (lstatSync(symlinkPath).isSymbolicLink()) unlinkSync(symlinkPath);
-          } catch { /* path doesn't exist at all */ }
-          if (existsSync(brokerDir)) {
-            renameSync(brokerDir, resolve(skillsDir, name));
+        // Then move each top-level broker dir back (once per namespace/skill)
+        let movedCount = 0;
+        for (const [brokerTop, srcTop] of brokerDirsToMove) {
+          try { if (lstatSync(srcTop).isSymbolicLink()) unlinkSync(srcTop); } catch {}
+          if (existsSync(brokerTop)) {
+            renameSync(brokerTop, srcTop);
             movedCount++;
           }
         }
-        writeFileSync(skillsPath, JSON.stringify({ skills: remainingSkills }, null, 2) + "\n");
         console.log(`✓ Merged INSTRUCTIONS.md into SKILL.md for ${mergedCount} skill(s)`);
-        console.log(`✓ Moved ${movedCount} skill(s) back to ${skillsDir}`);
-        console.log(`✓ Written: ${skillsPath}`);
+        console.log(`✓ Moved ${movedCount} dir(s) back to ${skillsDir}`);
       }
+    }
+
+    if (!anyFound) {
+      console.log(`\nSkills: no entries with a known migratedFrom label — nothing to revert.`);
+    } else if (!dryRun) {
+      writeFileSync(skillsPath, JSON.stringify({ skills }, null, 2) + "\n");
+      console.log(`✓ Written: ${skillsPath}`);
+    } else {
+      console.log("\n--- skills.json after revert (dry run) ---");
+      console.log(JSON.stringify({ skills }, null, 2));
+      console.log("--- (not written) ---");
     }
   }
 }
