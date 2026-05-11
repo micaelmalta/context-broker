@@ -92,6 +92,7 @@ describe("detectShellSecretFile", () => {
     expect(format("K", 'val"with"quotes')).toBe('set -gx K "val\\"with\\"quotes"');
     expect(format("K", "val\\slash")).toBe('set -gx K "val\\\\slash"');
     expect(format("K", "val$VAR")).toBe('set -gx K "val\\$VAR"');
+    expect(format("K", "val(cmd)")).toBe('set -gx K "val\\(cmd\\)"');
   });
 
   it("zsh format escapes special chars in value", () => {

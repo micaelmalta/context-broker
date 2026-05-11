@@ -20,7 +20,7 @@ function escapeRegexKey(k: string): string {
 }
 
 function escapeFish(v: string): string {
-  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$");
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
 
 function escapeShell(v: string): string {
@@ -52,7 +52,7 @@ export function detectShellSecretFile(): ShellSecretFile {
 
 export function resolveBrokerEntry(distDir: string): BrokerEntry {
   try {
-    const bin = execSync("which context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
+    const bin = execSync("command -v context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
     // Reject npx shims — check path components for node_modules or _npx
     const binParts = bin.split(/[\\/]/);
     if (bin && !binParts.includes("node_modules") && !binParts.includes("_npx")) {
