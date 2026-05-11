@@ -25,6 +25,7 @@ import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { detectShellSecretFile, resolveBrokerEntry } from "../dist/migrate-helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -102,43 +103,6 @@ function deriveKeywords(name, cfg) {
     if (text.includes(kw)) words.add(kw);
   }
   return [...words];
-}
-
-// ─── Shell detection for secrets ───────────────────────────────────────────
-
-function detectShellSecretFile() {
-  const shell = process.env.SHELL ?? "";
-  if (shell.endsWith("fish")) {
-    const filePath = resolve(homedir(), ".config", "fish", "config.fish");
-    return {
-      path: filePath,
-      format: (k, v) => `set -gx ${k} "${v}"`,
-      checkExisting: (content, k) => content.includes(`set -gx ${k} `) || content.includes(`set -Ux ${k} `),
-      label: "~/.config/fish/config.fish",
-    };
-  }
-  const filePath = resolve(homedir(), ".zshenv");
-  return {
-    path: filePath,
-    format: (k, v) => `export ${k}="${v}"`,
-    checkExisting: (content, k) => content.includes(`export ${k}=`),
-    label: "~/.zshenv",
-  };
-}
-
-// ─── Broker binary detection ────────────────────────────────────────────────
-
-function resolveBrokerEntry() {
-  try {
-    const bin = execSync("which context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
-    if (bin) return { command: bin, args: [] };
-  } catch { /* not installed globally */ }
-
-  const distPath = resolve(__dirname, "..", "dist", "index.js");
-  if (existsSync(distPath)) return { command: "node", args: [distPath] };
-
-  console.warn("  ⚠  context-broker binary not found — using npx fallback. Run `npm install -g context-broker` for a stable install.");
-  return { command: "npx", args: ["-y", "context-broker"] };
 }
 
 // ─── Servers migration ─────────────────────────────────────────────────────
@@ -310,7 +274,7 @@ if (migrateServers) {
 
   // ─── Register context-broker router in ~/.claude.json ───────────────────
   const claudeJsonPath = resolve(homedir(), ".claude.json");
-  const brokerEntry = resolveBrokerEntry();
+  const brokerEntry = resolveBrokerEntry(resolve(__dirname, "..", "dist"));
 
   if (dryRun) {
     console.log("\n--- ~/.claude.json broker entry (dry run) ---");
