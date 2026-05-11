@@ -400,7 +400,7 @@ export class ProcessManager {
           childPending.delete(id);
           reject(new Error(`Request ${id} timed out after ${timeoutMs}ms`));
         }
-      }, timeoutMs);
+      }, timeoutMs).unref();
 
       child.stdin?.write(JSON.stringify(request) + "\n");
     });

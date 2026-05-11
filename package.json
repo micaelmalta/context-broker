@@ -26,14 +26,18 @@
         "migrate": "node scripts/migrate.mjs",
         "revert-migration": "node scripts/revert-migration.mjs",
         "benchmark": "node scripts/benchmark.mjs",
-        "prepublishOnly": "npm run build"
+        "prepublishOnly": "npm run build",
+        "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning node_modules/.bin/jest"
     },
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.0.0",
         "zod": "^3.22.4"
     },
     "devDependencies": {
+        "@types/jest": "^30.0.0",
         "@types/node": "^20.0.0",
+        "jest": "^30.4.2",
+        "ts-jest": "^29.4.9",
         "tsx": "^4.0.0",
         "typescript": "^5.0.0"
     }

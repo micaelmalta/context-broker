@@ -315,6 +315,7 @@ if (migrateSkills) {
       mkdirSync(brokerSkillsDir, { recursive: true });
       mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
 
+      let splitCount = 0;
       for (const entry of Object.keys(convertedSkills)) {
         const src = resolve(skillsDir, entry);
         const dst = resolve(brokerSkillsDir, entry);
@@ -325,7 +326,25 @@ if (migrateSkills) {
         } else {
           console.log(`  Exists:   ${dst} (skipped move)`);
         }
+
+        // Split SKILL.md into frontmatter stub + INSTRUCTIONS.md
+        const dstSkillPath = resolve(dst, "SKILL.md");
+        const dstInstructions = resolve(dst, "INSTRUCTIONS.md");
+        if (existsSync(dstSkillPath) && !existsSync(dstInstructions)) {
+          const content = readFileSync(dstSkillPath, "utf-8");
+          const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
+          if (match) {
+            const body = match[2].replace(/^\n+/, "");
+            if (body) {
+              writeFileSync(dstSkillPath, match[1]);
+              writeFileSync(dstInstructions, body);
+              splitCount++;
+              console.log(`✓ Split:    ${dstSkillPath}`);
+            }
+          }
+        }
       }
+      if (splitCount > 0) console.log(`✓ Split ${splitCount} skill(s) into SKILL.md stub + INSTRUCTIONS.md`);
 
       writeFileSync(skillsOutPath, JSON.stringify(mergedSkills, null, 2) + "\n");
       console.log(`✓ Written: ${skillsOutPath}`);

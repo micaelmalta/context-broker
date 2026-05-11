@@ -96,7 +96,7 @@ function buildMcpConfig(serverNames, extras = []) {
   const mcpServers = {};
   for (const name of serverNames) {
     const cfg = servers[name];
-    if (!cfg) continue;
+    if (!cfg || !cfg.command) continue;
     const env = {};
     for (const [k, v] of Object.entries(cfg.env ?? {})) {
       env[k] = v.replace(/\$\{(\w+)\}/g, (_, n) => process.env[n] ?? "");
@@ -121,12 +121,13 @@ function buildMcpConfig(serverNames, extras = []) {
 const PROMPT = "Say only: ok";
 
 async function runClaude(mcpConfig, extraArgs = []) {
+  const hasMcpServers = Object.keys(mcpConfig.mcpServers ?? {}).length > 0;
   const claudeArgs = [
     "-p", PROMPT,
     "--output-format", "json",
     "--tools", "",
     "--no-session-persistence",
-    "--mcp-config", JSON.stringify(mcpConfig),
+    ...(hasMcpServers ? ["--mcp-config", JSON.stringify(mcpConfig)] : []),
     "--bare",
     ...extraArgs,
   ];
