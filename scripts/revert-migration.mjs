@@ -153,6 +153,25 @@ if (revertServers) {
       }
     }
   }
+
+  // ─── Remove context-broker router from ~/.claude.json ───────────────────
+  const claudeJsonPath = resolve(homedir(), ".claude.json");
+  if (existsSync(claudeJsonPath)) {
+    if (dryRun) {
+      console.log(`\n--- ~/.claude.json broker removal (dry run) ---`);
+      console.log(`  Would remove "context-broker" from mcpServers`);
+      console.log("--- (not written) ---");
+    } else {
+      const claudeJson = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
+      if (claudeJson.mcpServers?.["context-broker"]) {
+        delete claudeJson.mcpServers["context-broker"];
+        writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
+        console.log(`✓ Removed context-broker from ${claudeJsonPath}`);
+      } else {
+        console.log(`  context-broker not found in ${claudeJsonPath} — skipped`);
+      }
+    }
+  }
 }
 
 // ─── Skills revert ─────────────────────────────────────────────────────────

@@ -269,6 +269,29 @@ if (migrateServers) {
     writeFileSync(outPath, JSON.stringify(existing, null, 2) + "\n");
     console.log(`\n✓ Written: ${outPath}`);
   }
+
+  // ─── Register context-broker router in ~/.claude.json ───────────────────
+  const claudeJsonPath = resolve(homedir(), ".claude.json");
+  const brokerEntry = {
+    command: "node",
+    args: [resolve(__dirname, "..", "dist", "index.js")],
+  };
+
+  if (dryRun) {
+    console.log("\n--- ~/.claude.json broker entry (dry run) ---");
+    console.log(JSON.stringify({ "context-broker": brokerEntry }, null, 2));
+    console.log("--- (not written) ---");
+  } else {
+    const claudeJson = existsSync(claudeJsonPath) ? JSON.parse(readFileSync(claudeJsonPath, "utf-8")) : {};
+    if (!claudeJson.mcpServers) claudeJson.mcpServers = {};
+    if (!claudeJson.mcpServers["context-broker"]) {
+      claudeJson.mcpServers["context-broker"] = brokerEntry;
+      writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
+      console.log(`✓ Registered context-broker in ${claudeJsonPath}`);
+    } else {
+      console.log(`  context-broker already registered in ${claudeJsonPath} — skipped`);
+    }
+  }
 }
 
 // ─── Skills migration ──────────────────────────────────────────────────────
