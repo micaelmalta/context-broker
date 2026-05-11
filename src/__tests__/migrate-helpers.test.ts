@@ -43,6 +43,8 @@ describe("detectShellSecretFile", () => {
     expect(checkExisting("# nothing here\n", "MY_KEY")).toBe(false);
     expect(checkExisting("set -g MY_KEY value\n", "MY_KEY")).toBe(false);
     expect(checkExisting("set -U MY_KEY value\n", "MY_KEY")).toBe(false);
+    expect(checkExisting("set --unexport MY_KEY value\n", "MY_KEY")).toBe(false);
+    expect(checkExisting("set --export MY_KEY value\n", "MY_KEY")).toBe(true);
   });
 
   it("returns zshenv for zsh shell", () => {
