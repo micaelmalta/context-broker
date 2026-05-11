@@ -85,6 +85,7 @@ describe("detectShellSecretFile", () => {
     const { format } = detectShellSecretFile();
     expect(format("K", 'val"with"quotes')).toBe('set -gx K "val\\"with\\"quotes"');
     expect(format("K", "val\\slash")).toBe('set -gx K "val\\\\slash"');
+    expect(format("K", "val$VAR")).toBe('set -gx K "val\\$VAR"');
   });
 
   it("zsh format escapes special chars in value", () => {
@@ -93,6 +94,7 @@ describe("detectShellSecretFile", () => {
     expect(format("K", 'val"q')).toBe('export K="val\\"q"');
     expect(format("K", "val$VAR")).toBe('export K="val\\$VAR"');
     expect(format("K", "val\\slash")).toBe('export K="val\\\\slash"');
+    expect(format("K", "val`cmd`")).toBe('export K="val\\`cmd\\`"');
   });
 });
 

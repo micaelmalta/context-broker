@@ -26,15 +26,16 @@ import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
-import { detectShellSecretFile, resolveBrokerEntry } from "../dist/migrate-helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Guard: dist/migrate-helpers.js must exist (produced by `npm run build`)
-if (!existsSync(resolve(__dirname, "..", "dist", "migrate-helpers.js"))) {
+const _helpersPath = resolve(__dirname, "..", "dist", "migrate-helpers.js");
+if (!existsSync(_helpersPath)) {
   console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
   process.exit(1);
 }
+const { detectShellSecretFile, resolveBrokerEntry } = await import(_helpersPath);
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 
