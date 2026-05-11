@@ -207,13 +207,13 @@ The worst case — every server active simultaneously — costs roughly the same
 Run the benchmark against your own config:
 
 ```bash
-npm run benchmark
+npx context-broker benchmark
 
 # Subset of servers
-npm run benchmark -- --servers fetch-mcp,jira
+npx context-broker benchmark --servers fetch-mcp,jira
 
 # Average over multiple rounds
-npm run benchmark -- --rounds 3
+npx context-broker benchmark --rounds 3
 ```
 
 ---
@@ -224,27 +224,25 @@ Import your existing MCP servers, skills, and plugin skills in one command:
 
 ```bash
 # From Claude Code  (~/.claude.json + ~/.claude/skills/ + ~/.claude/plugins/cache/)
-node scripts/migrate.mjs --from claude
+npx context-broker migrate --from claude
 
 # From Cursor  (~/.cursor/mcp.json)
-node scripts/migrate.mjs --from cursor
+npx context-broker migrate --from cursor
 
 # From OpenCode  (~/.config/opencode/opencode.json)
-node scripts/migrate.mjs --from opencode
+npx context-broker migrate --from opencode
 
 # From any file
-node scripts/migrate.mjs --from /path/to/mcp.json
+npx context-broker migrate --from /path/to/mcp.json
 
 # Preview changes without writing
-node scripts/migrate.mjs --from claude --dry-run
+npx context-broker migrate --from claude --dry-run
 
 # Migrate only specific parts
-node scripts/migrate.mjs --from claude --servers
-node scripts/migrate.mjs --from claude --skills
-node scripts/migrate.mjs --from claude --plugins
+npx context-broker migrate --from claude --servers
+npx context-broker migrate --from claude --skills
+npx context-broker migrate --from claude --plugins
 ```
-
-Or via npm: `npm run migrate -- --from claude`
 
 **What the migration does:**
 
@@ -258,18 +256,16 @@ Or via npm: `npm run migrate -- --from claude`
 ```bash
 # Restore everything — servers back to ~/.claude.json, skills back to ~/.claude/skills/,
 # plugin SKILL.md files restored, SessionStart hook removed
-node scripts/revert-migration.mjs --from claude
+npx context-broker revert --from claude
 
 # Preview without writing
-node scripts/revert-migration.mjs --from claude --dry-run
+npx context-broker revert --from claude --dry-run
 
 # Revert only specific parts
-node scripts/revert-migration.mjs --from claude --servers
-node scripts/revert-migration.mjs --from claude --skills
-node scripts/revert-migration.mjs --from claude --plugins
+npx context-broker revert --from claude --servers
+npx context-broker revert --from claude --skills
+npx context-broker revert --from claude --plugins
 ```
-
-Or via npm: `npm run revert-migration -- --from claude`
 
 **What the revert does:**
 
