@@ -292,6 +292,14 @@ export class ProcessManager {
     const initRes = await fetch(url, { method: "POST", headers, body: initBody });
     if (!initRes.ok) throw new Error(`HTTP ${initRes.status} initializing ${serverName}: ${await initRes.text()}`);
 
+    // Persist session ID for all subsequent requests (required by some servers e.g. Datadog)
+    const sessionId = initRes.headers.get("mcp-session-id");
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+
+    // Send initialized notification (some servers won't respond to tools/list without it)
+    const notifBody = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+    await fetch(url, { method: "POST", headers, body: notifBody }).catch(() => {/* best-effort */});
+
     type ToolsListResult = {
       tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
       nextCursor?: string;
