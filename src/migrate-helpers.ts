@@ -15,24 +15,34 @@ export interface BrokerEntry {
   args: string[];
 }
 
+function escapeFish(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function escapeShell(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "\\$");
+}
+
 export function detectShellSecretFile(): ShellSecretFile {
   const shell = process.env.SHELL ?? "";
   if (shell.endsWith("fish")) {
     const filePath = resolve(homedir(), ".config", "fish", "config.fish");
     return {
       path: filePath,
-      format: (k, v) => `set -gx ${k} "${v}"`,
+      format: (k, v) => `set -gx ${k} "${escapeFish(v)}"`,
       checkExisting: (content, k) =>
-        content.includes(`set -gx ${k} `) || content.includes(`set -Ux ${k} `),
+        new RegExp(`^\\s*set\\s+-(g|U)x\\s+${k}\\s`, "m").test(content),
       label: "~/.config/fish/config.fish",
     };
   }
-  const filePath = resolve(homedir(), ".zshenv");
+  const isBash = shell.endsWith("bash");
+  const filePath = resolve(homedir(), isBash ? ".bashrc" : ".zshenv");
   return {
     path: filePath,
-    format: (k, v) => `export ${k}="${v}"`,
-    checkExisting: (content, k) => content.includes(`export ${k}=`),
-    label: "~/.zshenv",
+    format: (k, v) => `export ${k}="${escapeShell(v)}"`,
+    checkExisting: (content, k) =>
+      new RegExp(`^\\s*export\\s+${k}=`, "m").test(content),
+    label: isBash ? "~/.bashrc" : "~/.zshenv",
   };
 }
 
@@ -43,7 +53,9 @@ export function resolveBrokerEntry(distDir: string): BrokerEntry {
   } catch { /* not installed globally */ }
 
   const distPath = resolve(distDir, "index.js");
-  if (existsSync(distPath)) return { command: "node", args: [distPath] };
+  if (existsSync(distPath) && !distDir.includes("node_modules")) {
+    return { command: "node", args: [distPath] };
+  }
 
   console.warn(
     "  ⚠  context-broker binary not found — using npx fallback. " +

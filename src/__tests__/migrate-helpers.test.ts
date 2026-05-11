@@ -47,10 +47,18 @@ describe("detectShellSecretFile", () => {
     expect(result.format("MY_KEY", "myval")).toBe('export MY_KEY="myval"');
   });
 
-  it("returns zshenv for bash shell", () => {
+  it("returns bashrc for bash shell", () => {
     process.env.SHELL = "/bin/bash";
     const result = detectShellSecretFile();
+    expect(result.path).toBe("/home/testuser/.bashrc");
+    expect(result.label).toBe("~/.bashrc");
+  });
+
+  it("returns zshenv for unknown/empty shell", () => {
+    process.env.SHELL = "";
+    const result = detectShellSecretFile();
     expect(result.path).toBe("/home/testuser/.zshenv");
+    expect(result.label).toBe("~/.zshenv");
   });
 
   it("zsh checkExisting detects export", () => {
@@ -58,6 +66,33 @@ describe("detectShellSecretFile", () => {
     const { checkExisting } = detectShellSecretFile();
     expect(checkExisting('export MY_KEY="value"\n', "MY_KEY")).toBe(true);
     expect(checkExisting("# nothing\n", "MY_KEY")).toBe(false);
+  });
+
+  it("checkExisting does not false-positive on prefix match", () => {
+    process.env.SHELL = "/bin/zsh";
+    const { checkExisting } = detectShellSecretFile();
+    expect(checkExisting('export MY_KEY_OLD="value"\n', "MY_KEY")).toBe(false);
+  });
+
+  it("fish checkExisting does not false-positive on prefix match", () => {
+    process.env.SHELL = "/usr/bin/fish";
+    const { checkExisting } = detectShellSecretFile();
+    expect(checkExisting("set -gx MY_KEY_OLD value\n", "MY_KEY")).toBe(false);
+  });
+
+  it("fish format escapes special chars in value", () => {
+    process.env.SHELL = "/usr/bin/fish";
+    const { format } = detectShellSecretFile();
+    expect(format("K", 'val"with"quotes')).toBe('set -gx K "val\\"with\\"quotes"');
+    expect(format("K", "val\\slash")).toBe('set -gx K "val\\\\slash"');
+  });
+
+  it("zsh format escapes special chars in value", () => {
+    process.env.SHELL = "/bin/zsh";
+    const { format } = detectShellSecretFile();
+    expect(format("K", 'val"q')).toBe('export K="val\\"q"');
+    expect(format("K", "val$VAR")).toBe('export K="val\\$VAR"');
+    expect(format("K", "val\\slash")).toBe('export K="val\\\\slash"');
   });
 });
 
@@ -91,5 +126,12 @@ describe("resolveBrokerEntry", () => {
     mockExecSyncFn.mockReturnValue("  /usr/bin/context-broker  \n");
     const result = resolveBrokerEntry("/some/dist");
     expect(result.command).toBe("/usr/bin/context-broker");
+  });
+
+  it("skips local dist when path is inside node_modules (npx run)", () => {
+    mockExecSyncFn.mockImplementation(() => { throw new Error("not found"); });
+    mockExistsSyncFn.mockReturnValue(true);
+    const result = resolveBrokerEntry("/tmp/.npm/_npx/abc123/node_modules/context-broker/dist");
+    expect(result).toEqual({ command: "npx", args: ["-y", "context-broker"] });
   });
 });

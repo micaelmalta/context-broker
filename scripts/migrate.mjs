@@ -5,8 +5,9 @@
 // registers them in skills.json, and leaves symlinks so slash commands still work.
 // With --plugins, splits ~/.claude/plugins/cache/**/SKILL.md into stubs +
 // INSTRUCTIONS.md and registers all plugin skills in skills.json.
-// Detected secrets are extracted to the shell config file (~/.zshenv for zsh/bash,
-// ~/.config/fish/config.fish for fish) and replaced with ${VAR} refs.
+// Detected secrets are extracted to the shell config file (~/.bashrc for bash,
+// ~/.zshenv for zsh, ~/.config/fish/config.fish for fish) and replaced with ${VAR} refs.
+// Requires: npm run build (produces dist/migrate-helpers.js)
 //
 // Usage:
 //   node scripts/migrate.mjs                        # auto-discovers all sources
@@ -28,6 +29,12 @@ import { fileURLToPath } from "url";
 import { detectShellSecretFile, resolveBrokerEntry } from "../dist/migrate-helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Guard: dist/migrate-helpers.js must exist (produced by `npm run build`)
+if (!existsSync(resolve(__dirname, "..", "dist", "migrate-helpers.js"))) {
+  console.error("✗ dist/migrate-helpers.js not found. Run `npm run build` first.");
+  process.exit(1);
+}
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 
@@ -227,6 +234,7 @@ if (migrateServers) {
         const block = `\n# MCP Broker secrets — migrated from ${label} (${new Date().toISOString().slice(0,10)})\n` +
           newSecrets.map(([k, v]) => shellSecretFile.format(k, v)).join("\n") + "\n";
         shellSecretContent += block;
+        mkdirSync(dirname(shellSecretFile.path), { recursive: true });
         writeFileSync(shellSecretFile.path, shellSecretContent);
         console.log(`✓ Written: ${shellSecretFile.path} (${newSecrets.length} secrets added)`);
       }
