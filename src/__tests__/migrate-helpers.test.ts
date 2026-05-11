@@ -74,6 +74,12 @@ describe("detectShellSecretFile", () => {
     expect(checkExisting('export MY_KEY_OLD="value"\n', "MY_KEY")).toBe(false);
   });
 
+  it("fish checkExisting matches at end of file without trailing newline", () => {
+    process.env.SHELL = "/usr/bin/fish";
+    const { checkExisting } = detectShellSecretFile();
+    expect(checkExisting("set -gx MY_KEY value", "MY_KEY")).toBe(true);
+  });
+
   it("fish checkExisting does not false-positive on prefix match", () => {
     process.env.SHELL = "/usr/bin/fish";
     const { checkExisting } = detectShellSecretFile();

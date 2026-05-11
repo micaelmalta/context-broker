@@ -35,7 +35,7 @@ export function detectShellSecretFile(): ShellSecretFile {
       path: filePath,
       format: (k, v) => `set -gx ${k} "${escapeFish(v)}"`,
       checkExisting: (content, k) =>
-        new RegExp(`^\\s*set\\s+-(g|U)x\\s+${escapeRegexKey(k)}\\s`, "m").test(content),
+        new RegExp(`^\\s*set\\s+-(g|U)x\\s+${escapeRegexKey(k)}(\\s|$)`, "m").test(content),
       label: "~/.config/fish/config.fish",
     };
   }
@@ -53,14 +53,15 @@ export function detectShellSecretFile(): ShellSecretFile {
 export function resolveBrokerEntry(distDir: string): BrokerEntry {
   try {
     const bin = execSync("which context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
-    // Reject npx shims — paths containing node_modules or _npx are temporary cache entries
-    if (bin && !bin.includes("node_modules") && !bin.includes("_npx")) {
+    // Reject npx shims — check path components for node_modules or _npx
+    const binParts = bin.split(/[\\/]/);
+    if (bin && !binParts.includes("node_modules") && !binParts.includes("_npx")) {
       return { command: bin, args: [] };
     }
   } catch { /* not installed globally */ }
 
   const distPath = resolve(distDir, "index.js");
-  if (existsSync(distPath) && !distDir.includes("node_modules")) {
+  if (existsSync(distPath) && !distDir.split(/[\\/]/).includes("node_modules")) {
     return { command: "node", args: [distPath] };
   }
 
