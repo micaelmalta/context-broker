@@ -533,19 +533,19 @@ if (migratePlugins) {
       console.log(`✓ Split:   ${splitCount} SKILL.md files`);
       console.log(`✓ Written: ${skillsOutPath}`);
 
-      // Install split-skills.mjs into ~/.config/context-broker/scripts/
-      const scriptsSrc = resolve(__dirname, "split-skills.mjs");
-      const scriptsDst = resolve(homedir(), ".config", "context-broker", "scripts", "split-skills.mjs");
+      // Install session-sync.mjs into ~/.config/context-broker/scripts/
+      const scriptsSrc = resolve(__dirname, "session-sync.mjs");
+      const scriptsDst = resolve(homedir(), ".config", "context-broker", "scripts", "session-sync.mjs");
       mkdirSync(dirname(scriptsDst), { recursive: true });
       copyFileSync(scriptsSrc, scriptsDst);
       console.log(`✓ Installed: ${scriptsDst}`);
 
-      // Add SessionStart hook to keep plugin splits fresh after plugin updates
+      // Add SessionStart hook to keep skills fresh after plugin/agent updates
       const settingsPath = resolve(homedir(), ".claude", "settings.json");
       const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
       if (!settings.hooks) settings.hooks = {};
       if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
-      const hookCmd = "node ~/.config/context-broker/scripts/split-skills.mjs";
+      const hookCmd = "node ~/.config/context-broker/scripts/session-sync.mjs";
       const alreadyPresent = settings.hooks.SessionStart.some(entry =>
         entry.hooks?.some(h => h.command === hookCmd)
       );

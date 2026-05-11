@@ -322,18 +322,18 @@ if (revertPlugins) {
         if (restored > 0) console.log(`✓ Restored ${restored} SKILL.md files`);
         if (pluginEntries.length > 0) console.log(`✓ Removed ${pluginEntries.length} plugin entries from ${skillsPath}`);
 
-        // Remove the SessionStart split-skills hook from ~/.claude/settings.json
+        // Remove the SessionStart session-sync hook from ~/.claude/settings.json
         const settingsPath = resolve(homedir(), ".claude", "settings.json");
         if (existsSync(settingsPath)) {
           const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
           const hooks = settings.hooks?.SessionStart ?? [];
           const filtered = hooks.filter(entry =>
-            !entry.hooks?.some(h => h.command?.includes("split-skills.mjs"))
+            !entry.hooks?.some(h => h.command?.includes("session-sync.mjs") || h.command?.includes("split-skills.mjs"))
           );
           if (filtered.length !== hooks.length) {
             settings.hooks.SessionStart = filtered;
             writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-            console.log(`✓ Removed split-skills SessionStart hook from ${settingsPath}`);
+            console.log(`✓ Removed session-sync SessionStart hook from ${settingsPath}`);
           }
         }
       }
