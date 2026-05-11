@@ -34,8 +34,12 @@ export function detectShellSecretFile(): ShellSecretFile {
     return {
       path: filePath,
       format: (k, v) => `set -gx ${k} "${escapeFish(v)}"`,
-      checkExisting: (content, k) =>
-        new RegExp(`^\\s*set\\s+(?:-[a-zA-Z-]+\\s+)*${escapeRegexKey(k)}(\\s|$)`, "m").test(content),
+      checkExisting: (content, k) => {
+        const m = new RegExp(`^\\s*set\\s+((?:-[a-zA-Z-]+\\s+)*)${escapeRegexKey(k)}(\\s|$)`, "m").exec(content);
+        if (!m) return false;
+        // Only skip if the existing declaration is already exported (contains x or --export)
+        return /-[a-zA-Z]*x/.test(m[1]) || /--export/.test(m[1]);
+      },
       label: "~/.config/fish/config.fish",
     };
   }
