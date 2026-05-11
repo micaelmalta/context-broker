@@ -19,7 +19,7 @@
 //   node scripts/migrate.mjs --from claude --plugins
 //   node scripts/migrate.mjs --from cursor --dry-run
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, renameSync, symlinkSync, copyFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, lstatSync, renameSync, symlinkSync, copyFileSync } from "fs";
 import { resolve, dirname, basename, relative } from "path";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -270,9 +270,9 @@ if (migrateSkills) {
 
     for (const entry of readdirSync(skillsDir)) {
       const srcDir = resolve(skillsDir, entry);
-      const stat = statSync(srcDir);
-      // skip non-directories and already-symlinked entries
-      if (!stat.isDirectory()) continue;
+      const lstat = lstatSync(srcDir);
+      // skip non-directories and already-migrated symlinks
+      if (lstat.isSymbolicLink() || !lstat.isDirectory()) continue;
       const skillPath = resolve(brokerSkillsDir, entry, "SKILL.md");
       const srcSkillPath = resolve(srcDir, "SKILL.md");
       if (!existsSync(srcSkillPath)) {

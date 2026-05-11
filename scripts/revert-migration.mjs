@@ -194,10 +194,10 @@ if (revertSkills) {
             mergedCount++;
           }
 
-          // Remove symlink and move broker dir back to source
-          if (existsSync(symlinkPath) && lstatSync(symlinkPath).isSymbolicLink()) {
-            unlinkSync(symlinkPath);
-          }
+          // Remove symlink (use lstatSync — existsSync follows links and misses dangling ones)
+          try {
+            if (lstatSync(symlinkPath).isSymbolicLink()) unlinkSync(symlinkPath);
+          } catch { /* path doesn't exist at all */ }
           if (existsSync(brokerDir)) {
             renameSync(brokerDir, resolve(skillsDir, name));
             movedCount++;
