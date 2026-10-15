@@ -2,7 +2,7 @@
 // Handler tests for createBroker (meta-tools + proxying) using stub dependencies.
 
 import { jest, describe, it, expect, beforeEach } from "@jest/globals";
-import { createBroker } from "../broker.js";
+import { createBroker, summarizeDescription } from "../broker.js";
 import { ToolRouter, type ServerConfig } from "../router.js";
 import { SkillRouter } from "../skill-router.js";
 import type { ProcessManager, MCPTool } from "../process-manager.js";
@@ -112,6 +112,18 @@ describe("createBroker", () => {
       expect(text(r)).toMatch(/Activated "github" with 1 tools/);
     });
 
+    it("lists only the first sentence of each tool description on activation", async () => {
+      const long =
+        "Generate a plan and open an investigation.\n\nUSE WHEN: the request is to debug.\nRULES:\n1. " + "x".repeat(2000);
+      mk.manager.activate.mockResolvedValueOnce([
+        { name: "investigate", description: long, inputSchema: {}, serverName: "github" },
+      ]);
+      const r = await broker.callTool("activate_server", { server_name: "github" });
+      expect(text(r)).toContain("• investigate: Generate a plan and open an investigation.");
+      expect(text(r)).not.toContain("USE WHEN");
+      expect(text(r).length).toBeLessThan(400);
+    });
+
     it("flags unknown servers as errors", async () => {
       const r = await broker.callTool("activate_server", { server_name: "nope" });
       expect(r.isError).toBe(true);
@@ -206,5 +218,25 @@ describe("createBroker", () => {
       const bad = await broker.callTool("load_skill", { skill_name: "nope" });
       expect(bad.isError).toBe(true);
     });
+  });
+});
+
+describe("summarizeDescription", () => {
+  it("takes the first sentence and collapses whitespace", () => {
+    expect(summarizeDescription("Search code.  Returns\nchunks. More text.")).toBe("Search code.");
+  });
+  it("stops at a blank line when there is no full stop", () => {
+    expect(summarizeDescription("List all services\n\nUSE WHEN: x")).toBe("List all services");
+  });
+  it("does not split on e.g. / i.e.", () => {
+    expect(summarizeDescription("Find a thing (e.g. a file) by name. Extra.")).toBe("Find a thing (e.g. a file) by name.");
+  });
+  it("caps long sentences with an ellipsis", () => {
+    const out = summarizeDescription("a".repeat(500));
+    expect(out).toHaveLength(160);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  it("handles missing descriptions", () => {
+    expect(summarizeDescription(undefined)).toBe("");
   });
 });

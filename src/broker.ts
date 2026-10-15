@@ -41,6 +41,26 @@ function matchedLine(keywords: string[], descriptionWords: string[], toolWords: 
   return parts.join(" | ") || "—";
 }
 
+const SUMMARY_MAX = 160;
+
+/**
+ * First sentence of a tool description, capped in length. Activation output uses this so a
+ * server with dozens of tools doesn't dump its full documentation into the context window —
+ * the complete descriptions are still in each tool's schema (tools/list).
+ */
+export function summarizeDescription(description: string | undefined, max = SUMMARY_MAX): string {
+  const flat = (description ?? "").trim().split(/\n\s*\n/)[0].replace(/\s+/g, " ");
+  let end = flat.length;
+  for (const m of flat.matchAll(/[.!?](?=\s|$)/g)) {
+    const i = m.index!;
+    if (/(?:e\.g|i\.e|etc|vs)$/i.test(flat.slice(0, i))) continue; // abbreviation, not a sentence end
+    end = i + 1;
+    break;
+  }
+  const sentence = flat.slice(0, end);
+  return sentence.length > max ? sentence.slice(0, max - 1).trimEnd() + "…" : sentence;
+}
+
 export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
   function listTools() {
     const activeTools = manager.getAllActiveTools().map((t) => ({
@@ -103,8 +123,9 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
         try {
           const tools = await manager.activate(a.server_name, cfg);
           return text(
-            `✓ Activated "${a.server_name}" with ${tools.length} tools:\n` +
-              tools.map((t) => `  • ${t.name}: ${t.description}`).join("\n")
+            `✓ Activated "${a.server_name}" with ${tools.length} tools (first sentence of each; ` +
+              `full descriptions are in the tool schemas):\n` +
+              tools.map((t) => `  • ${t.name}: ${summarizeDescription(t.description)}`).join("\n")
           );
         } catch (err) {
           return fail(`Failed to activate "${a.server_name}": ${(err as Error).message}`);
