@@ -3,8 +3,16 @@
 // ~/.config/context-broker/servers.json.
 // Registers skills and commands in-place (no file moves) in skills.json, and
 // splits SKILL.md into frontmatter stub + INSTRUCTIONS.md where they live.
-// Detected secrets are extracted to the shell config file (~/.bashrc for bash,
-// ~/.zshenv for zsh, ~/.config/fish/config.fish for fish) and replaced with ${VAR} refs.
+// Detected secrets (env values and Authorization-style headers) are extracted to the
+// shell config file (~/.bashrc for bash, ~/.zshenv for zsh, ~/.config/fish/config.fish
+// for fish) and replaced with ${VAR} refs.
+//
+// The broker itself is registered as "context-broker" in ~/.claude.json and in every other
+// source config it migrated entries out of (Cursor, OpenCode), so those clients keep their tools.
+//
+// Every config file that is modified is backed up first (<file>.bak-<timestamp>) and
+// written atomically. Note: project-scoped servers in ~/.claude.json
+// (projects[path].mcpServers) are not migrated — only the global ones.
 // Requires: npm run build (produces dist/migrate-helpers.js)
 //
 // Usage:
@@ -19,11 +27,22 @@
 //   node scripts/migrate.mjs --plugins
 //   node scripts/migrate.mjs --dry-run
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, lstatSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, lstatSync, copyFileSync, readFileSync } from "fs";
 import { resolve, dirname, basename, relative, extname } from "path";
-import { execSync } from "child_process";
 import { homedir } from "os";
 import { fileURLToPath, pathToFileURL } from "url";
+import {
+  backupFile,
+  writeFileAtomic,
+  writeJsonSafe,
+  readJsonFile,
+  findFiles,
+  deriveEntry,
+  splitSkillMd,
+  uniqueSkillKey,
+  fromCursorVars,
+  mapStrings,
+} from "./lib/shared.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -79,13 +98,32 @@ function resolveSkillSources() {
 
 const SECRET_KEY_RE = /(_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIAL|_DSN|_URI|_CERT|_PRIVATE)$/i;
 const SECRET_VAL_RE = /^(ATATT|ghp_|gho_|glpat-|sk-|xox[bpoas]-|ey[A-Za-z0-9])/;
+const SECRET_HEADER_RE = /authorization|api[-_]?key|token|secret|password/i;
 const MIN_SECRET_LEN = 20;
 
 function isSecret(key, value) {
   if (typeof value !== "string") return false;
+  if (value.includes("${")) return false; // already a reference
   if (SECRET_KEY_RE.test(key)) return true;
   if (value.length >= MIN_SECRET_LEN && SECRET_VAL_RE.test(value)) return true;
   return false;
+}
+
+const envName = (s) => s.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+// Replace secret-looking header values (e.g. "Authorization: Bearer abc") with ${VAR} refs.
+function extractHeaderSecrets(serverName, headers, secretsToWrite) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (typeof v !== "string" || v.includes("${") || !SECRET_HEADER_RE.test(k)) { out[k] = v; continue; }
+    const m = v.match(/^(Bearer|Basic|Token)\s+(.+)$/i);
+    const prefix = m ? `${m[1]} ` : "";
+    const secret = m ? m[2] : v;
+    const varName = `${envName(serverName)}_${envName(k)}`;
+    secretsToWrite[varName] = secret;
+    out[k] = `${prefix}\${${varName}}`;
+  }
+  return out;
 }
 
 function deriveKeywords(name, cfg) {
@@ -102,50 +140,34 @@ function deriveKeywords(name, cfg) {
   return [...words];
 }
 
-// Split a SKILL.md into frontmatter stub + INSTRUCTIONS.md in-place.
-// Returns true if a split was performed.
-function splitSkillMd(skillPath) {
-  if (!existsSync(skillPath)) return false;
-  const instructionsPath = skillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
-  if (existsSync(instructionsPath)) return false;
-  const content = readFileSync(skillPath, "utf-8");
-  const match = content.match(/^(---\n[\s\S]*?\n---\n)([\s\S]*)$/);
-  if (!match) return false;
-  const body = match[2].replace(/^\n+/, "");
-  if (!body) return false;
-  writeFileSync(skillPath, match[1]);
-  writeFileSync(instructionsPath, body);
-  return true;
-}
-
-// Build a registry entry from a SKILL.md path.
-// If the file has a frontmatter `description` field, it takes priority over the first prose line.
-function skillEntry(key, skillPath, extra = {}) {
-  const content = readFileSync(skillPath, "utf-8");
-  const fmMatch = content.match(/^---\n[\s\S]*?\n---/);
-  let fmDescription = null;
-  if (fmMatch) {
-    const descMatch = fmMatch[0].match(/^description:\s*(.+)$/m);
-    if (descMatch) fmDescription = descMatch[1].trim().replace(/^["']|["']$/g, "");
+// Normalise one source's server table to { name: {type,url,oauth,headers,env} | {command,args,env} }.
+function readSourceServers(raw, label) {
+  const unvar = label === "cursor" ? (v) => mapStrings(v, fromCursorVars) : (v) => v;
+  const servers = {};
+  if (raw.mcpServers) {
+    for (const [name, cfg] of Object.entries(raw.mcpServers)) {
+      if (cfg.type === "http" || cfg.url) {
+        servers[name] = { type: "http", url: unvar(cfg.url), oauth: cfg.oauth ?? null, headers: unvar(cfg.headers ?? null), env: unvar(cfg.env ?? {}) };
+      } else {
+        servers[name] = { command: unvar(cfg.command), args: unvar(cfg.args ?? []), env: unvar(cfg.env ?? {}) };
+      }
+    }
+  } else if (raw.mcp) {
+    for (const [name, cfg] of Object.entries(raw.mcp)) {
+      if (cfg.type === "remote" || cfg.url) {
+        servers[name] = { type: "http", url: cfg.url, oauth: cfg.oauth ?? null, headers: cfg.headers ?? null, env: cfg.environment ?? {} };
+      } else {
+        const [command, ...cmdArgs] = Array.isArray(cfg.command) ? cfg.command : [cfg.command];
+        servers[name] = { command, args: cmdArgs, env: cfg.environment ?? {} };
+      }
+    }
+  } else {
+    return null;
   }
-  const firstLine = content.split("\n").find(l => l.match(/^[A-Za-z]/)) ?? "";
-  const description = (fmDescription ?? firstLine).slice(0, 120) || `Skill: ${key}`;
-  const words = new Set();
-  key.toLowerCase().split(/[-_/\s:]+/).forEach(w => w.length > 2 && words.add(w));
-  description.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 6).forEach(w => words.add(w));
-  return { description, keywords: [...words], path: skillPath, ...extra };
+  return servers;
 }
 
-// Build a registry entry from a command .md path.
-function commandEntry(key, cmdPath, extra = {}) {
-  const content = readFileSync(cmdPath, "utf-8");
-  const firstLine = content.split("\n").find(l => l.match(/^[A-Za-z]/)) ?? "";
-  const description = firstLine.replace(/^#+\s*/, "").slice(0, 120) || `Command: ${key}`;
-  const words = new Set();
-  key.toLowerCase().split(/[-_/\s:]+/).forEach(w => w.length > 2 && words.add(w));
-  description.toLowerCase().split(/\W+/).filter(w => w.length > 4).slice(0, 8).forEach(w => words.add(w));
-  return { description, keywords: [...words], path: cmdPath, ...extra };
-}
+const unique = (arr) => [...new Set(arr)];
 
 // ─── Servers migration ─────────────────────────────────────────────────────
 
@@ -159,72 +181,45 @@ if (migrateServers) {
   const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
 
   const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
-  let existing = { servers: {} };
-  if (existsSync(outPath)) existing = JSON.parse(readFileSync(outPath, "utf-8"));
+  const existing = readJsonFile(outPath, { servers: {} });
+  if (!existing.servers) existing.servers = {};
 
   const shellSecretFile = detectShellSecretFile();
   let shellSecretContent = existsSync(shellSecretFile.path) ? readFileSync(shellSecretFile.path, "utf-8") : "";
-  const allSecrets = {};
+  let shellSecretsDirty = false;
 
-  for (const { label, path: sourcePath } of resolveServerSources()) {
-    if (!existsSync(sourcePath)) {
-      console.log(`\n⚠  Server config not found: ${sourcePath} — skipping.`);
-      continue;
-    }
+  const settingsPath = resolve(homedir(), ".claude", "settings.json");
+  const settings = readJsonFile(settingsPath, null);
 
-    const raw = JSON.parse(readFileSync(sourcePath, "utf-8"));
+  // Source edits are applied only after servers.json is safely written.
+  const sourceEdits = [];   // { sourcePath, raw, names }
+  const pluginDisables = new Set();
+  const seenNames = new Set();
 
-    let mcpServers = {};
-    if (raw.mcpServers) {
-      for (const [name, cfg] of Object.entries(raw.mcpServers)) {
-        if (cfg.type === "http" || cfg.url) {
-          mcpServers[name] = { type: "http", url: cfg.url, oauth: cfg.oauth ?? null, headers: cfg.headers ?? null, env: cfg.env ?? {} };
-        } else {
-          mcpServers[name] = { command: cfg.command, args: cfg.args ?? [], env: cfg.env ?? {} };
-        }
-      }
-    } else if (raw.mcp) {
-      for (const [name, cfg] of Object.entries(raw.mcp)) {
-        if (cfg.type === "remote" || cfg.url) {
-          mcpServers[name] = { type: "http", url: cfg.url, oauth: cfg.oauth ?? null, headers: cfg.headers ?? null, env: cfg.environment ?? {} };
-        } else {
-          const [command, ...cmdArgs] = Array.isArray(cfg.command) ? cfg.command : [cfg.command];
-          mcpServers[name] = { command, args: cmdArgs, env: cfg.environment ?? {} };
-        }
-      }
-    } else {
-      console.log(`\n⚠  Unrecognized server config format in ${sourcePath} — skipping.`);
-      continue;
-    }
+  const SKIP = new Set(["router", "broker", "context-broker"]);
 
-    // Also pull in HTTP servers from plugin .mcp.json files (e.g. Slack)
-    const pluginsCache = resolve(homedir(), ".claude", "plugins", "cache");
-    if (existsSync(pluginsCache)) {
-      let pluginMcpFiles = [];
-      try {
-        pluginMcpFiles = execSync(`find "${pluginsCache}" -name ".mcp.json" -maxdepth 5`, { encoding: "utf-8" })
-          .trim().split("\n").filter(Boolean);
-      } catch { /* ignore */ }
-      for (const mcpFile of pluginMcpFiles) {
-        try {
-          const pluginMcp = JSON.parse(readFileSync(mcpFile, "utf-8"));
-          for (const [name, cfg] of Object.entries(pluginMcp.mcpServers ?? {})) {
-            if ((cfg.type === "http" || cfg.url) && !mcpServers[name]) {
-              mcpServers[name] = { type: "http", url: cfg.url, oauth: cfg.oauth ?? null, headers: cfg.headers ?? null, env: {} };
-            }
-          }
-        } catch { /* skip malformed */ }
-      }
-    }
+  const claudeJsonPath = resolve(homedir(), ".claude.json");
+  const brokerEntry = resolveBrokerEntry(resolve(__dirname, "..", "dist"));
 
-    if (Object.keys(mcpServers).length === 0) continue;
+  // Add the broker to a non-Claude client's config, in that client's own format.
+  function addBroker(raw, key) {
+    raw[key] ??= {};
+    if (raw[key]["context-broker"]) return false;
+    raw[key]["context-broker"] = key === "mcp"
+      ? { type: "local", command: [brokerEntry.command, ...brokerEntry.args] }
+      : { ...brokerEntry };
+    return true;
+  }
 
-    const SKIP = new Set(["router", "broker", "context-broker"]);
+  // Convert one group of servers (a source file, or the plugin .mcp.json files).
+  function convertGroup(label, sourcePath, raw, mcpServers) {
     const converted = {}, skipped = [], secretsToWrite = {};
 
     for (const [name, cfg] of Object.entries(mcpServers)) {
       if (SKIP.has(name)) { skipped.push(name); continue; }
       if (!cfg.command && !cfg.url) { console.warn(`  ⚠  Skipping "${name}" — no command or url`); skipped.push(name); continue; }
+
+      const prev = existing.servers[name];
 
       const env = {};
       for (const [k, v] of Object.entries(cfg.env ?? {})) {
@@ -232,38 +227,56 @@ if (migrateServers) {
         else env[k] = v;
       }
 
+      // Keep user edits (description, keywords, autoActivate, timeouts) across re-runs.
+      const carried = {
+        description:  prev?.description ?? `${name} MCP server`,
+        keywords:     unique([...(prev?.keywords ?? []), ...deriveKeywords(name, cfg)]),
+        migratedFrom: label,
+        ...(prev?.toolTimeoutMs ? { toolTimeoutMs: prev.toolTimeoutMs } : {}),
+      };
+
       if (cfg.type === "http" || cfg.url) {
+        const headers = cfg.headers ? extractHeaderSecrets(name, cfg.headers, secretsToWrite) : null;
         converted[name] = {
-          description:  `Migrated from ${label}`,
-          keywords:     deriveKeywords(name, cfg),
+          ...carried,
           type:         "http",
           url:          cfg.url,
-          ...(cfg.oauth   ? { oauth: cfg.oauth }     : {}),
-          ...(cfg.headers ? { headers: cfg.headers } : {}),
+          ...(cfg.oauth ? { oauth: cfg.oauth } : {}),
+          ...(headers   ? { headers }          : {}),
           ...(Object.keys(env).length > 0 ? { env } : {}),
-          autoActivate: false,
+          autoActivate: prev?.autoActivate ?? false,
         };
       } else {
         converted[name] = {
-          description:  `Migrated from ${label}`,
-          keywords:     deriveKeywords(name, cfg),
+          ...carried,
           command:      cfg.command,
           args:         cfg.args ?? [],
           ...(Object.keys(env).length > 0 ? { env } : {}),
-          autoActivate: false,
+          autoActivate: prev?.autoActivate ?? false,
         };
       }
+      seenNames.add(name);
+    }
+
+    // Remember which plugins we disable so revert can re-enable exactly those.
+    const toDisable = {};
+    for (const [pluginKey, enabled] of Object.entries(settings?.enabledPlugins ?? {})) {
+      const pluginName = pluginKey.split("@")[0];
+      if (converted[pluginName] && enabled === true) (toDisable[pluginName] ??= []).push(pluginKey);
+    }
+    for (const [name, keys] of Object.entries(toDisable)) {
+      converted[name].disabledPlugins = unique([...(existing.servers[name]?.disabledPlugins ?? []), ...keys]);
+      keys.forEach(k => pluginDisables.add(k));
     }
 
     const added   = Object.keys(converted).filter(k => !existing.servers[k]);
     const updated = Object.keys(converted).filter(k =>  existing.servers[k]);
     Object.assign(existing.servers, converted);
-    Object.assign(allSecrets, secretsToWrite);
 
     const newSecrets = Object.entries(secretsToWrite)
       .filter(([k]) => !shellSecretFile.checkExisting(shellSecretContent, k));
 
-    console.log(`\nSource:  ${sourcePath}`);
+    console.log(`\nSource:  ${sourcePath ?? label}`);
     console.log(`Servers: ${Object.keys(mcpServers).length} found → ${Object.keys(converted).length} converted`);
     if (skipped.length)    console.log(`Skipped: ${skipped.join(", ")}`);
     if (added.length)      console.log(`Add:     ${added.join(", ")}`);
@@ -271,72 +284,109 @@ if (migrateServers) {
     if (newSecrets.length) console.log(`Secrets: ${newSecrets.map(([k]) => k).join(", ")} → ${shellSecretFile.label}`);
     else if (Object.keys(secretsToWrite).length > 0) console.log(`Secrets: all already present in ${shellSecretFile.label}`);
 
-    if (!dryRun) {
-      // Append new secrets to the shell config file (fish or zsh/bash)
-      if (newSecrets.length > 0) {
-        const block = `\n# MCP Broker secrets — migrated from ${label.replace(/\n/g, " ")} (${new Date().toISOString().slice(0,10)})\n` +
-          newSecrets.map(([k, v]) => shellSecretFile.format(k, v)).join("\n") + "\n";
-        shellSecretContent += block;
-        mkdirSync(dirname(shellSecretFile.path), { recursive: true });
-        writeFileSync(shellSecretFile.path, shellSecretContent);
-        console.log(`✓ Written: ${shellSecretFile.path} (${newSecrets.length} secrets added)`);
-      }
+    if (!dryRun && newSecrets.length > 0) {
+      const block = `\n# MCP Broker secrets — migrated from ${label.replace(/\n/g, " ")} (${new Date().toISOString().slice(0,10)})\n` +
+        newSecrets.map(([k, v]) => shellSecretFile.format(k, v)).join("\n") + "\n";
+      shellSecretContent += block;
+      shellSecretsDirty = true;
+    }
 
-      // Remove migrated entries from source config so they don't load twice
-      const migratedNames = new Set(Object.keys(converted));
-      const remaining = Object.fromEntries(
-        Object.entries(raw.mcpServers ?? raw.mcp ?? {}).filter(([n]) => !migratedNames.has(n))
-      );
-      if (raw.mcpServers) raw.mcpServers = remaining;
-      else if (raw.mcp) raw.mcp = remaining;
-      writeFileSync(sourcePath, JSON.stringify(raw, null, 2) + "\n");
-      console.log(`✓ Removed ${migratedNames.size} entries from ${sourcePath}`);
+    if (raw && sourcePath) sourceEdits.push({ sourcePath, raw, names: new Set(Object.keys(converted)) });
+  }
 
-      // Disable plugins whose MCP server was migrated (avoids double-loading)
-      const settingsPath = resolve(homedir(), ".claude", "settings.json");
-      if (existsSync(settingsPath)) {
-        const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-        const plugins = settings.enabledPlugins ?? {};
-        let disabledCount = 0;
-        for (const pluginKey of Object.keys(plugins)) {
-          const pluginName = pluginKey.split("@")[0];
-          if (migratedNames.has(pluginName) && plugins[pluginKey] === true) {
-            plugins[pluginKey] = false;
-            disabledCount++;
+  for (const { label, path: sourcePath } of resolveServerSources()) {
+    if (!existsSync(sourcePath)) {
+      console.log(`\n⚠  Server config not found: ${sourcePath} — skipping.`);
+      continue;
+    }
+
+    let raw;
+    try {
+      raw = readJsonFile(sourcePath);
+    } catch (err) {
+      console.log(`\n⚠  ${err.message} — skipping.`);
+      continue;
+    }
+
+    const mcpServers = readSourceServers(raw, label);
+    if (!mcpServers) {
+      console.log(`\n⚠  Unrecognized server config format in ${sourcePath} — skipping.`);
+      continue;
+    }
+    if (Object.keys(mcpServers).length === 0) continue;
+    convertGroup(label, sourcePath, raw, mcpServers);
+  }
+
+  // HTTP servers shipped by Claude Code plugins (e.g. Slack) — scanned once and
+  // labelled "plugin", not attributed to whichever source happened to run last.
+  const pluginsCacheForServers = resolve(homedir(), ".claude", "plugins", "cache");
+  if ((!fromArg || fromArg === "claude") && existsSync(pluginsCacheForServers)) {
+    const pluginServers = {};
+    for (const mcpFile of findFiles(pluginsCacheForServers, { name: ".mcp.json", type: "file", maxDepth: 5 })) {
+      try {
+        const pluginMcp = readJsonFile(mcpFile);
+        for (const [name, cfg] of Object.entries(pluginMcp.mcpServers ?? {})) {
+          if ((cfg.type === "http" || cfg.url) && !seenNames.has(name) && !pluginServers[name]) {
+            pluginServers[name] = { type: "http", url: cfg.url, oauth: cfg.oauth ?? null, headers: cfg.headers ?? null, env: {} };
           }
         }
-        if (disabledCount > 0) {
-          writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-          console.log(`✓ Disabled ${disabledCount} plugin(s) in ${settingsPath}`);
-        }
-      }
+      } catch { /* skip malformed */ }
+    }
+    if (Object.keys(pluginServers).length > 0) {
+      convertGroup("plugin", `${pluginsCacheForServers} (plugin .mcp.json files)`, null, pluginServers);
     }
   }
 
+  // ── Write everything, safest-first: secrets → servers.json → source edits ──
   if (dryRun) {
     console.log("\n--- servers.json (dry run) ---");
     console.log(JSON.stringify(existing, null, 2));
     console.log("--- (not written) ---");
   } else {
-    mkdirSync(resolve(outPath, ".."), { recursive: true });
-    writeFileSync(outPath, JSON.stringify(existing, null, 2) + "\n");
+    if (shellSecretsDirty) {
+      const bak = backupFile(shellSecretFile.path);
+      writeFileAtomic(shellSecretFile.path, shellSecretContent);
+      console.log(`✓ Written: ${shellSecretFile.path}${bak ? ` (backup: ${bak})` : ""}`);
+    }
+
+    writeJsonSafe(outPath, existing);
     console.log(`\n✓ Written: ${outPath}`);
+
+    // Remove migrated entries from source configs so they don't load twice
+    for (const { sourcePath, raw, names } of sourceEdits) {
+      const key = raw.mcpServers ? "mcpServers" : "mcp";
+      raw[key] = Object.fromEntries(Object.entries(raw[key] ?? {}).filter(([n]) => !names.has(n)));
+      // ~/.claude.json gets its broker entry below; other clients need it here.
+      const registered = resolve(sourcePath) !== claudeJsonPath && addBroker(raw, key);
+      if (writeJsonSafe(sourcePath, raw)) {
+        console.log(`✓ Removed ${names.size} entries from ${sourcePath}`);
+        if (registered) console.log(`✓ Registered context-broker in ${sourcePath}`);
+      }
+    }
+
+    // Disable plugins whose MCP server was migrated (avoids double-loading)
+    if (settings && pluginDisables.size > 0) {
+      const plugins = settings.enabledPlugins ?? {};
+      for (const k of pluginDisables) plugins[k] = false;
+      writeJsonSafe(settingsPath, settings);
+      console.log(`✓ Disabled ${pluginDisables.size} plugin(s) in ${settingsPath}`);
+    }
   }
 
   // ─── Register context-broker router in ~/.claude.json ───────────────────
-  const claudeJsonPath = resolve(homedir(), ".claude.json");
-  const brokerEntry = resolveBrokerEntry(resolve(__dirname, "..", "dist"));
-
   if (dryRun) {
+    for (const { sourcePath } of sourceEdits) {
+      if (resolve(sourcePath) !== claudeJsonPath) console.log(`\n  Would register context-broker in ${sourcePath}`);
+    }
     console.log("\n--- ~/.claude.json broker entry (dry run) ---");
     console.log(JSON.stringify({ "context-broker": brokerEntry }, null, 2));
     console.log("--- (not written) ---");
   } else {
-    const claudeJson = existsSync(claudeJsonPath) ? JSON.parse(readFileSync(claudeJsonPath, "utf-8")) : {};
+    const claudeJson = readJsonFile(claudeJsonPath, {});
     if (!claudeJson.mcpServers) claudeJson.mcpServers = {};
     if (!claudeJson.mcpServers["context-broker"]) {
       claudeJson.mcpServers["context-broker"] = brokerEntry;
-      writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
+      writeJsonSafe(claudeJsonPath, claudeJson);
       console.log(`✓ Registered context-broker in ${claudeJsonPath}`);
     } else {
       console.log(`  context-broker already registered in ${claudeJsonPath} — skipped`);
@@ -352,10 +402,8 @@ if (migrateServers) {
 if (migrateSkills) {
   const skillsOutPath = skillsOutArg ?? resolve(homedir(), ".config", "context-broker", "skills.json");
 
-  let existingSkills = { skills: {} };
-  if (existsSync(skillsOutPath)) {
-    existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
-  }
+  const existingSkills = readJsonFile(skillsOutPath, { skills: {} });
+  if (!existingSkills.skills) existingSkills.skills = {};
 
   for (const { label, path: skillsDir } of resolveSkillSources()) {
     if (!existsSync(skillsDir)) {
@@ -366,15 +414,24 @@ if (migrateSkills) {
     const converted = {};
     const skipped = [];
 
+    // Same-named skills from different sources get "<name>@<label>" instead of clobbering.
+    const claim = (key, path) => uniqueSkillKey({ ...existingSkills.skills, ...converted }, key, path, label);
+
     // Register all commands/*.md from a commands dir under a given key prefix
     function registerCommands(keyPrefix, commandsDir) {
       if (!existsSync(commandsDir)) return;
       for (const file of readdirSync(commandsDir)) {
         if (extname(file) !== ".md") continue;
-        const cmdName = basename(file, ".md");
-        const cmdKey = `${keyPrefix}:${cmdName}`;
-        converted[cmdKey] = commandEntry(cmdKey, resolve(commandsDir, file), { migratedFrom: label });
+        const cmdPath = resolve(commandsDir, file);
+        const cmdKey = claim(`${keyPrefix}:${basename(file, ".md")}`, cmdPath);
+        converted[cmdKey] = deriveEntry(cmdKey, cmdPath, { migratedFrom: label }, { command: true });
       }
+    }
+
+    function registerSkill(key, skillPath, commandsDir) {
+      const k = claim(key, skillPath);
+      converted[k] = deriveEntry(k, skillPath, { migratedFrom: label });
+      registerCommands(k, commandsDir);
     }
 
     for (const entry of readdirSync(skillsDir)) {
@@ -385,8 +442,7 @@ if (migrateSkills) {
       const skillPath = resolve(entryPath, "SKILL.md");
       if (existsSync(skillPath)) {
         // Flat skill with SKILL.md
-        converted[entry] = skillEntry(entry, skillPath, { migratedFrom: label });
-        registerCommands(entry, resolve(entryPath, "commands"));
+        registerSkill(entry, skillPath, resolve(entryPath, "commands"));
       } else {
         // Check for namespaced skills (subdirs with SKILL.md)
         let hasSkills = false;
@@ -397,9 +453,7 @@ if (migrateSkills) {
           const subSkillPath = resolve(subPath, "SKILL.md");
           if (!existsSync(subSkillPath)) continue;
           hasSkills = true;
-          const key = `${entry}/${sub}`;
-          converted[key] = skillEntry(key, subSkillPath, { migratedFrom: label });
-          registerCommands(key, resolve(subPath, "commands"));
+          registerSkill(`${entry}/${sub}`, subSkillPath, resolve(subPath, "commands"));
         }
 
         if (!hasSkills) {
@@ -430,9 +484,9 @@ if (migrateSkills) {
 
     if (!dryRun) {
       let splitCount = 0;
-      for (const cfg of Object.values(converted)) {
+      for (const [key, cfg] of Object.entries(converted)) {
         if (!cfg.path.endsWith("SKILL.md")) continue;
-        if (splitSkillMd(cfg.path)) {
+        if (splitSkillMd(cfg.path, key)) {
           splitCount++;
           console.log(`✓ Split:  ${cfg.path}`);
         }
@@ -446,8 +500,7 @@ if (migrateSkills) {
     console.log(JSON.stringify(existingSkills, null, 2));
     console.log("--- (not written) ---");
   } else {
-    mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
-    writeFileSync(skillsOutPath, JSON.stringify(existingSkills, null, 2) + "\n");
+    writeJsonSafe(skillsOutPath, existingSkills);
     console.log(`✓ Written: ${skillsOutPath}`);
   }
 }
@@ -463,26 +516,11 @@ if (migratePlugins) {
   if (!existsSync(pluginsCache)) {
     console.log(`\n⚠  Plugins cache not found: ${pluginsCache} — skipping plugins migration.`);
   } else {
-    let skillFiles;
-    try {
-      skillFiles = execSync(`find "${pluginsCache}" -name "SKILL.md"`, { encoding: "utf-8" })
-        .trim().split("\n").filter(Boolean);
-    } catch {
-      skillFiles = [];
-    }
+    const skillFiles = findFiles(pluginsCache, { name: "SKILL.md", type: "file", maxDepth: 10 });
+    const commandsDirs = findFiles(pluginsCache, { name: "commands", type: "dir", maxDepth: 6 });
 
-    let commandsDirs;
-    try {
-      commandsDirs = execSync(`find "${pluginsCache}" -type d -name "commands" -maxdepth 6`, { encoding: "utf-8" })
-        .trim().split("\n").filter(Boolean);
-    } catch {
-      commandsDirs = [];
-    }
-
-    let existingSkills = { skills: {} };
-    if (existsSync(skillsOutPath)) {
-      existingSkills = JSON.parse(readFileSync(skillsOutPath, "utf-8"));
-    }
+    const existingSkills = readJsonFile(skillsOutPath, { skills: {} });
+    if (!existingSkills.skills) existingSkills.skills = {};
 
     let splitCount = 0;
     const converted = {};
@@ -495,9 +533,8 @@ if (migratePlugins) {
       const pluginName = rel[1] ?? skillName;
       const key = `${pluginName}:${skillName}`;
 
-      converted[key] = skillEntry(key, skillPath, { plugin: pluginName });
-
-      if (!dryRun && splitSkillMd(skillPath)) splitCount++;
+      if (!dryRun && splitSkillMd(skillPath, key)) splitCount++;
+      converted[key] = deriveEntry(key, skillPath, { plugin: pluginName });
     }
 
     // Register commands from commands/ directories
@@ -513,10 +550,9 @@ if (migratePlugins) {
 
       for (const file of readdirSync(commandsDir)) {
         if (extname(file) !== ".md") continue;
-        const cmdName = basename(file, ".md");
-        const key = `${pluginName}:${cmdName}`;
+        const key = `${pluginName}:${basename(file, ".md")}`;
         if (converted[key]) continue; // skill takes priority
-        converted[key] = commandEntry(key, resolve(commandsDir, file), { plugin: pluginName });
+        converted[key] = deriveEntry(key, resolve(commandsDir, file), { plugin: pluginName }, { command: true });
       }
     }
 
@@ -534,21 +570,20 @@ if (migratePlugins) {
       console.log(JSON.stringify(converted, null, 2));
       console.log("--- (not written) ---");
     } else {
-      mkdirSync(resolve(skillsOutPath, ".."), { recursive: true });
-      writeFileSync(skillsOutPath, JSON.stringify(merged, null, 2) + "\n");
+      writeJsonSafe(skillsOutPath, merged);
       if (splitCount > 0) console.log(`✓ Split:   ${splitCount} SKILL.md file(s)`);
       console.log(`✓ Written: ${skillsOutPath}`);
 
-      // Install session-sync.mjs into ~/.config/context-broker/scripts/
-      const scriptsSrc = resolve(__dirname, "session-sync.mjs");
-      const scriptsDst = resolve(homedir(), ".config", "context-broker", "scripts", "session-sync.mjs");
-      mkdirSync(dirname(scriptsDst), { recursive: true });
-      copyFileSync(scriptsSrc, scriptsDst);
-      console.log(`✓ Installed: ${scriptsDst}`);
+      // Install session-sync.mjs (+ its lib/) into ~/.config/context-broker/scripts/
+      const scriptsDstDir = resolve(homedir(), ".config", "context-broker", "scripts");
+      mkdirSync(resolve(scriptsDstDir, "lib"), { recursive: true });
+      copyFileSync(resolve(__dirname, "session-sync.mjs"), resolve(scriptsDstDir, "session-sync.mjs"));
+      copyFileSync(resolve(__dirname, "lib", "shared.mjs"), resolve(scriptsDstDir, "lib", "shared.mjs"));
+      console.log(`✓ Installed: ${resolve(scriptsDstDir, "session-sync.mjs")}`);
 
       // Add SessionStart hook to keep skills fresh after plugin/agent updates
       const settingsPath = resolve(homedir(), ".claude", "settings.json");
-      const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
+      const settings = readJsonFile(settingsPath, {});
       if (!settings.hooks) settings.hooks = {};
       if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
       const hookCmd = "node ~/.config/context-broker/scripts/session-sync.mjs";
@@ -557,7 +592,7 @@ if (migratePlugins) {
       );
       if (!alreadyPresent) {
         settings.hooks.SessionStart.push({ hooks: [{ type: "command", command: hookCmd }] });
-        writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+        writeJsonSafe(settingsPath, settings);
         console.log(`✓ Added SessionStart hook → ${settingsPath}`);
       } else {
         console.log(`  SessionStart hook already present — skipped`);

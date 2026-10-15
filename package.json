@@ -28,10 +28,12 @@
         "revert-migration": "node dist/index.js revert",
         "benchmark": "node dist/index.js benchmark",
         "prepublishOnly": "npm run build",
-        "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning node_modules/.bin/jest"
+        "pretest": "tsc",
+        "test": "node --experimental-vm-modules --no-warnings=ExperimentalWarning node_modules/.bin/jest",
+        "typecheck": "tsc --noEmit"
     },
     "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.0.0",
+        "@modelcontextprotocol/sdk": "^1.29.0",
         "zod": "^3.22.4"
     },
     "devDependencies": {
@@ -41,5 +43,8 @@
         "ts-jest": "^29.4.9",
         "tsx": "^4.0.0",
         "typescript": "^5.0.0"
+    },
+    "engines": {
+        "node": ">=18.17"
     }
 }

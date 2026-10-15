@@ -5,8 +5,14 @@
 // Strategies:
 //   baseline  — no MCP servers at all (pure system prompt cost)
 //   direct    — all servers loaded upfront every request (current worst case)
-//   broker    — only 4 meta-tools visible; servers loaded on demand
+//   broker    — only the broker's 6 meta-tools visible; servers loaded on demand
 //   activated — broker + all servers loaded (broker worst case)
+//
+// Caveats: every run is a single cold-cache turn (--no-session-persistence), so the numbers
+// are first-turn costs. In a long session tool schemas are prompt-cached and cost far less
+// per turn, so real-world savings per request are smaller than the "cost saving" shown here.
+// HTTP servers are measured only when they carry a static Authorization header; servers
+// that need an interactive OAuth flow cannot be exercised by `claude -p` and are skipped.
 //
 // Usage:
 //   node scripts/benchmark.mjs
@@ -19,7 +25,7 @@ import { promisify } from "util";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
 import { homedir } from "os";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const execFileAsync = promisify(execFile);
 
@@ -47,23 +53,39 @@ const configPath = resolveConfig();
 const { servers: allServers } = JSON.parse(readFileSync(configPath, "utf-8"));
 
 const subset = serverArg ? new Set(serverArg.split(",").map(s => s.trim())) : null;
-const servers = Object.fromEntries(
-  Object.entries(allServers).filter(([name]) => !subset || subset.has(name))
-);
+
+const expandVars = (v) => v.replace(/\$\{(\w+)\}/g, (_, n) => process.env[n] ?? "");
+const hasAuthHeader = (cfg) =>
+  Object.keys(cfg.headers ?? {}).some(k => k.toLowerCase() === "authorization");
+
+// Only servers `claude -p` can actually start unattended are measured.
+const skippedServers = [];
+const servers = {};
+for (const [name, cfg] of Object.entries(allServers)) {
+  if (subset && !subset.has(name)) continue;
+  if (cfg.command) {
+    servers[name] = cfg;
+  } else if (cfg.url && hasAuthHeader(cfg)) {
+    servers[name] = cfg;
+  } else {
+    skippedServers.push(`${name} (${cfg.url ? "needs interactive OAuth" : "no command"})`);
+  }
+}
 
 if (Object.keys(servers).length === 0) {
-  console.error("No servers to benchmark.");
+  console.error("No servers to benchmark." + (skippedServers.length ? ` Skipped: ${skippedServers.join(", ")}` : ""));
   process.exit(1);
 }
 
 // ─── Broker meta-tool definitions ─────────────────────────────────────────
 
-const BROKER_META_TOOLS = [
-  { name: "discover_tools",     description: "Find which tool servers are available and relevant for a task. Call this first when you need a capability you don't have yet.", inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-  { name: "activate_server",    description: "Load and connect a tool server, making its tools available. Call discover_tools first to find the right server name.", inputSchema: { type: "object", properties: { server_name: { type: "string" } }, required: ["server_name"] } },
-  { name: "deactivate_server",  description: "Shut down a tool server to free resources.", inputSchema: { type: "object", properties: { server_name: { type: "string" } }, required: ["server_name"] } },
-  { name: "list_active_servers", description: "Show which servers are currently active and their tools.", inputSchema: { type: "object", properties: {} } },
-];
+// Use the broker's real meta-tool definitions so the idle cost is not understated.
+const metaToolsPath = resolve(__dirname, "..", "dist", "meta-tools.js");
+if (!existsSync(metaToolsPath)) {
+  console.error("✗ dist/meta-tools.js not found. Run `npm run build` first.");
+  process.exit(1);
+}
+const BROKER_META_TOOLS = (await import(pathToFileURL(metaToolsPath).href)).META_TOOLS;
 
 function makeFakeMcpScript() {
   return `
@@ -96,16 +118,20 @@ function buildMcpConfig(serverNames, extras = []) {
   const mcpServers = {};
   for (const name of serverNames) {
     const cfg = servers[name];
-    if (!cfg || !cfg.command) continue;
-    const env = {};
-    for (const [k, v] of Object.entries(cfg.env ?? {})) {
-      env[k] = v.replace(/\$\{(\w+)\}/g, (_, n) => process.env[n] ?? "");
+    if (!cfg) continue;
+    if (cfg.command) {
+      const env = {};
+      for (const [k, v] of Object.entries(cfg.env ?? {})) env[k] = expandVars(v);
+      mcpServers[name] = {
+        command: cfg.command,
+        args: cfg.args ?? [],
+        ...(Object.keys(env).length ? { env } : {}),
+      };
+    } else {
+      const headers = {};
+      for (const [k, v] of Object.entries(cfg.headers ?? {})) headers[k] = expandVars(v);
+      mcpServers[name] = { type: "http", url: cfg.url, headers };
     }
-    mcpServers[name] = {
-      command: cfg.command,
-      args: cfg.args ?? [],
-      ...(Object.keys(env).length ? { env } : {}),
-    };
   }
   for (const { name, tools } of extras) {
     mcpServers[name] = {
@@ -197,6 +223,7 @@ console.log(`\nMCP Broker Benchmark`);
 console.log(`${"─".repeat(60)}`);
 console.log(`Config:  ${configPath}`);
 console.log(`Servers: ${n}  (${serverNames.join(", ")})`);
+if (skippedServers.length) console.log(`Skipped: ${skippedServers.join(", ")}`);
 console.log(`Rounds:  ${roundsArg}`);
 console.log(`Prompt:  "${PROMPT}"\n`);
 console.log(`Running strategies...\n`);
@@ -208,8 +235,8 @@ const brokerFull  = buildMcpConfig(serverNames, [{ name: "broker", tools: BROKER
 
 const baseline  = await measure("baseline",  "no MCP servers (pure system prompt)",              empty,      roundsArg, ["--disable-slash-commands"]);
 const direct_r  = await measure("direct",    `all ${n} servers loaded upfront`,                  direct,     roundsArg);
-const broker_r  = await measure("broker",    "4 meta-tools only (idle)",                         brokerIdle, roundsArg);
-const activated = await measure("activated", `4 meta-tools + all ${n} servers (worst case)`,     brokerFull, roundsArg);
+const broker_r  = await measure("broker",    `${BROKER_META_TOOLS.length} meta-tools only (idle)`,                         brokerIdle, roundsArg);
+const activated = await measure("activated", `${BROKER_META_TOOLS.length} meta-tools + all ${n} servers (worst case)`,     brokerFull, roundsArg);
 
 // ─── Report ────────────────────────────────────────────────────────────────
 
@@ -269,4 +296,6 @@ for (const r of ok) {
   console.log(`${colL(r.label, 14)} ${colR(fmt(r.inputTokens), 10)} ${colR(fmt(r.cacheCreate), 13)} ${colR(fmt(r.cacheRead), 12)} ${colR(fmt(r.totalInput), 8)}`);
 }
 
-console.log(`\n${"─".repeat(W)}\n`);
+console.log(`\n${"─".repeat(W)}`);
+console.log(`Note: single cold-cache turn. With prompt caching, repeated turns cost much less,`);
+console.log(`so per-request savings in a long session are smaller than shown above.\n`);

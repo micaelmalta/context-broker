@@ -2,42 +2,63 @@
 // Scores and loads relevant skills based on a query
 
 import { readFileSync, existsSync } from "fs";
+import { parseSkillsConfig, reportConfigErrors } from "./config.js";
+import { scoreEntry } from "./scoring.js";
+import { LOG_PREFIX } from "./version.js";
 
 export interface SkillConfig {
   description: string;
   keywords: string[];
   path: string;
+  migratedFrom?: string;
+  plugin?: string;
 }
 
 export interface SkillRouterResult {
   name: string;
   score: number;
   reason: string[];
+  descriptionMatches: string[];
 }
 
 export class SkillRouter {
   private skills: Record<string, SkillConfig>;
+  private readonly configPath?: string;
 
-  constructor(skills: Record<string, SkillConfig>) {
+  constructor(skills: Record<string, SkillConfig>, configPath?: string) {
     this.skills = skills;
+    this.configPath = configPath;
+  }
+
+  /** Re-read skills.json (session-sync rewrites it at every session start). */
+  reloadFromDisk(): boolean {
+    if (!this.configPath) return false;
+    try {
+      const raw = JSON.parse(readFileSync(this.configPath, "utf-8"));
+      const { entries, errors } = parseSkillsConfig(raw, this.configPath);
+      reportConfigErrors(errors);
+      this.skills = entries;
+      return true;
+    } catch (err) {
+      console.error(
+        `${LOG_PREFIX} Could not reload ${this.configPath}: ${(err as Error).message} — keeping previous skills`
+      );
+      return false;
+    }
   }
 
   rank(query: string): SkillRouterResult[] {
-    const q = query.toLowerCase();
     const results: SkillRouterResult[] = [];
 
     for (const [name, config] of Object.entries(this.skills)) {
-      const matchedKeywords = config.keywords.filter(kw =>
-        q.includes(kw.toLowerCase())
-      );
-
-      const descWords = config.description.toLowerCase().split(/\s+/);
-      const descMatches = descWords.filter(w => w.length > 4 && q.includes(w));
-
-      const score = (matchedKeywords.length * 2) + descMatches.length;
-
-      if (score > 0) {
-        results.push({ name, score, reason: matchedKeywords });
+      const s = scoreEntry(query, config);
+      if (s.score > 0) {
+        results.push({
+          name,
+          score: s.score,
+          reason: s.keywords,
+          descriptionMatches: s.descriptionWords,
+        });
       }
     }
 

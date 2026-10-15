@@ -2,14 +2,158 @@
 // Manages lifecycle of child MCP server processes (stdio) and HTTP MCP servers
 
 import { spawn, ChildProcess } from "child_process";
-import { ServerConfig } from "./router.js";
+import { ServerConfig, OAuthConfig } from "./router.js";
 import { getAccessToken } from "./oauth.js";
+import { VERSION, LOG_PREFIX } from "./version.js";
+import { buildChildEnv } from "./child-env.js";
+
+/** Streamable HTTP MCP clients must advertise both JSON and SSE. */
+const MCP_HTTP_ACCEPT = "application/json, text/event-stream";
+/** Protocol revision we offer; servers answer with the revision they support. */
+const PROTOCOL_VERSION = "2025-06-18";
+
+/** Default per-call timeout for tools/call (override with `toolTimeoutMs`). */
+export const DEFAULT_TOOL_TIMEOUT_MS = 5 * 60 * 1000;
+/** Sandbox wrappers may `docker build` on first launch before speaking MCP. */
+const STDIO_HANDSHAKE_TIMEOUT_MS = 600_000;
+const HTTP_HANDSHAKE_TIMEOUT_MS = 60_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
+export class HttpStatusError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly serverName: string,
+    body: string
+  ) {
+    super(`HTTP ${status} from ${serverName}: ${body}`);
+    this.name = "HttpStatusError";
+  }
+}
+
+/** JSON-RPC error returned by a server; keeps `code` and `data`. */
+export class McpRpcError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: number,
+    public readonly data?: unknown
+  ) {
+    super(message);
+    this.name = "McpRpcError";
+  }
+}
+
+function toRpcError(e: { message?: string; code?: number; data?: unknown } | undefined): McpRpcError {
+  return new McpRpcError(e?.message ?? "Unknown JSON-RPC error", e?.code, e?.data);
+}
+
+type JsonObject = Record<string, unknown>;
+
+function parseSseBlock(block: string): unknown | undefined {
+  const dataLines = block
+    .split(/\r?\n/)
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => l.slice(5).replace(/^ /, ""));
+  if (dataLines.length === 0) return undefined;
+  const payload = dataLines.join("\n").trim();
+  if (!payload || payload === "[DONE]") return undefined;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return undefined; // ignore non-JSON data
+  }
+}
+
+function isResponseFor(msg: unknown, id: number | string | undefined): boolean {
+  if (!msg || typeof msg !== "object") return false;
+  const m = msg as JsonObject;
+  return !("method" in m) && id !== undefined && m.id === id;
+}
+
+async function readSseStream(res: Response, expectedId: number | string): Promise<unknown> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fallback: unknown;
+
+  const consider = (block: string): unknown | undefined => {
+    const msg = parseSseBlock(block);
+    if (msg === undefined) return undefined;
+    if (isResponseFor(msg, expectedId)) return msg;
+    if (!(msg as JsonObject).method) fallback = msg;
+    return undefined;
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: !done });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() ?? "";
+    for (const block of blocks) {
+      const hit = consider(block);
+      if (hit !== undefined) {
+        await reader.cancel().catch(() => undefined);
+        return hit;
+      }
+    }
+    if (done) break;
+  }
+  if (buffer.trim()) {
+    const hit = consider(buffer);
+    if (hit !== undefined) return hit;
+  }
+  return fallback ?? {};
+}
+
+/**
+ * Parse application/json or text/event-stream MCP responses into a JSON-RPC object.
+ * For SSE, the message whose `id` equals `expectedId` wins (streams are read
+ * incrementally and closed as soon as it arrives); otherwise the last
+ * non-request message is used.
+ */
+export async function readMcpHttpResponse(
+  res: Response,
+  expectedId?: number | string
+): Promise<unknown> {
+  const ct = res.headers.get("content-type") ?? "";
+
+  if (
+    ct.includes("text/event-stream") &&
+    expectedId !== undefined &&
+    res.body &&
+    typeof res.body.getReader === "function"
+  ) {
+    return readSseStream(res, expectedId);
+  }
+
+  const text = await res.text();
+  if (!text) return {};
+
+  if (ct.includes("text/event-stream") || text.startsWith("event:") || text.includes("\ndata:")) {
+    let fallback: unknown;
+    for (const block of text.split(/\r?\n\r?\n/)) {
+      const msg = parseSseBlock(block);
+      if (msg === undefined) continue;
+      if (isResponseFor(msg, expectedId)) return msg;
+      if (!(msg as JsonObject).method) fallback = msg;
+    }
+    if (fallback !== undefined) return fallback;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Non-JSON MCP HTTP response (${ct || "unknown content-type"})`);
+  }
+}
 
 export interface ActiveServer {
   name: string;
   process: ChildProcess;
   tools: MCPTool[];
   activatedAt: Date;
+  /** Stable hash of stdio spawn inputs; if config changes, ProcessManager respawns. */
+  spawnSig: string;
+  toolTimeoutMs: number;
 }
 
 export interface ActiveHttpServer {
@@ -19,7 +163,12 @@ export interface ActiveHttpServer {
   tools: MCPTool[];
   activatedAt: Date;
   nextId: number;
-  config: ServerConfig;  // kept for token refresh on 401
+  config: ServerConfig; // kept for token refresh on 401
+  /** Resolved OAuth overrides (may be empty when fully auto-discovered). */
+  oauth?: OAuthConfig;
+  /** True when the user supplied an Authorization header; we never replace it. */
+  staticAuth: boolean;
+  toolTimeoutMs: number;
 }
 
 export interface MCPTool {
@@ -29,9 +178,25 @@ export interface MCPTool {
   serverName: string; // track which server owns this tool
 }
 
+export interface ProcessManagerOptions {
+  /** Called whenever the set of exposed tools changes (activate, deactivate, exit, refresh). */
+  onToolsChanged?: () => void;
+  /** Tool names that servers may not expose (e.g. the broker's own meta-tools). */
+  reservedToolNames?: Iterable<string>;
+  /** Called with a server's full tool list after activation and after every refresh. */
+  onServerTools?: (serverName: string, tools: MCPTool[]) => void;
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  const lower = name.toLowerCase();
+  return Object.keys(headers).some((k) => k.toLowerCase() === lower && headers[k]);
+}
+
 export class ProcessManager {
   private active = new Map<string, ActiveServer>();
   private activeHttp = new Map<string, ActiveHttpServer>();
+  /** In-flight activations, so concurrent callers share one spawn / OAuth flow. */
+  private activating = new Map<string, Promise<MCPTool[]>>();
   // Keyed by child process so IDs are scoped per-child and never collide
   private pendingRequests = new Map<ChildProcess, Map<number, {
     resolve: (val: unknown) => void;
@@ -42,31 +207,95 @@ export class ProcessManager {
   // Per-child monotonic request counter
   private requestIds = new Map<ChildProcess, number>();
 
-  async activate(name: string, config: ServerConfig): Promise<MCPTool[]> {
-    if (this.active.has(name)) return this.active.get(name)!.tools;
-    if (this.activeHttp.has(name)) return this.activeHttp.get(name)!.tools;
+  private readonly onToolsChanged?: () => void;
+  private readonly onServerTools?: (serverName: string, tools: MCPTool[]) => void;
+  private readonly reserved: Set<string>;
 
-    console.error(`[router] Activating server: ${name}`);
+  constructor(opts: ProcessManagerOptions = {}) {
+    this.onToolsChanged = opts.onToolsChanged;
+    this.onServerTools = opts.onServerTools;
+    this.reserved = new Set(opts.reservedToolNames ?? []);
+  }
 
+  private emitChanged(): void {
+    try {
+      this.onToolsChanged?.();
+    } catch {
+      /* listeners must never break lifecycle handling */
+    }
+  }
+
+  private reportTools(name: string, tools: MCPTool[]): void {
+    try {
+      this.onServerTools?.(name, tools);
+    } catch {
+      /* indexing must never break lifecycle handling */
+    }
+  }
+
+  /** Inputs that determine the stdio child process; any change requires a new spawn. */
+  private stdioSpawnSignature(config: ServerConfig): string {
+    return JSON.stringify({
+      command: config.command ?? null,
+      args: config.args ?? [],
+      env: config.env ?? {},
+      inheritEnv: config.inheritEnv ?? null,
+    });
+  }
+
+  activate(name: string, config: ServerConfig): Promise<MCPTool[]> {
+    const inFlight = this.activating.get(name);
+    if (inFlight) return inFlight;
+
+    const p = this.doActivate(name, config).finally(() => {
+      this.activating.delete(name);
+    });
+    this.activating.set(name, p);
+    return p;
+  }
+
+  private async doActivate(name: string, config: ServerConfig): Promise<MCPTool[]> {
     if (config.type === "http" || config.url) {
+      const existing = this.activeHttp.get(name);
+      if (existing) return existing.tools;
       return this.activateHttp(name, config);
     }
 
-    // Resolve env vars from process environment
-    const env = this.resolveEnv(config.env ?? {});
+    const sig = this.stdioSpawnSignature(config);
+    const existingStdio = this.active.get(name);
+    if (existingStdio) {
+      if (existingStdio.spawnSig === sig) return existingStdio.tools;
+      this.deactivate(name);
+    }
+    if (this.activeHttp.has(name)) return this.activeHttp.get(name)!.tools;
 
-    const child = spawn(config.command!, config.args ?? [], {
-      env: { ...process.env, ...env },
+    if (!config.command) {
+      throw new Error(`Server "${name}" has no command or url configured`);
+    }
+
+    console.error(`${LOG_PREFIX} Activating server: ${name}`);
+
+    const env = this.resolveEnv(config.env ?? {}, name);
+    const child = spawn(config.command, config.args ?? [], {
+      env: buildChildEnv(process.env, config.inheritEnv, env),
     }) as ChildProcess;
+
+    this.stdoutBuffers.set(child, "");
+    this.pendingRequests.set(child, new Map());
+    this.requestIds.set(child, 1);
+
+    // Without these listeners a bad command (ENOENT) or a dead pipe (EPIPE)
+    // would be an unhandled 'error' event and take down the whole broker.
+    child.on("error", (err) => {
+      this.rejectPending(child, new Error(`[${name}] failed to run "${config.command}": ${err.message}`));
+    });
+    child.stdin?.on("error", (err) => {
+      this.rejectPending(child, new Error(`[${name}] stdin error: ${err.message}`));
+    });
 
     child.stderr?.on("data", (data) => {
       console.error(`[${name}] ${data.toString().trim()}`);
     });
-
-    // Set up a single persistent stdout reader for this child process
-    this.stdoutBuffers.set(child, "");
-    this.pendingRequests.set(child, new Map());
-    this.requestIds.set(child, 1);
 
     child.stdout?.on("data", (chunk) => {
       const buf = (this.stdoutBuffers.get(child) ?? "") + chunk.toString();
@@ -75,83 +304,244 @@ export class ProcessManager {
 
       for (const line of lines) {
         if (!line.trim()) continue;
+        let msg: JsonObject;
         try {
-          const msg = JSON.parse(line);
-          const pending = this.pendingRequests.get(child)?.get(msg.id);
-          if (pending) {
-            this.pendingRequests.get(child)!.delete(msg.id);
-            if (msg.error) {
-              pending.reject(new Error(msg.error.message));
-            } else {
-              pending.resolve(msg.result);
-            }
-          }
+          msg = JSON.parse(line);
         } catch {
-          // non-JSON line, skip
+          continue; // non-JSON line
         }
+        this.handleChildMessage(name, child, msg);
       }
     });
 
     // Reject all pending requests if the child exits unexpectedly
     child.on("exit", (code) => {
-      const pending = this.pendingRequests.get(child);
-      if (pending && pending.size > 0) {
-        const err = new Error(`[${name}] process exited with code ${code}`);
-        for (const { reject } of pending.values()) reject(err);
-        pending.clear();
-      }
+      this.rejectPending(child, new Error(`[${name}] process exited with code ${code}`));
       // Remove from active map if it died on its own
       if (this.active.get(name)?.process === child) {
         this.active.delete(name);
-        this.stdoutBuffers.delete(child);
-        this.pendingRequests.delete(child);
-        this.requestIds.delete(child);
-        console.error(`[router] ${name} exited (code ${code})`);
+        this.forgetChild(child);
+        console.error(`${LOG_PREFIX} ${name} exited (code ${code})`);
+        this.emitChanged();
       }
     });
 
-    // Fetch tools via MCP initialize + tools/list
-    // Sandbox wrappers (e.g. run-mcp-sandbox) may run `docker build` on first launch;
-    // that can take minutes before the real MCP process speaks JSON on stdout.
-    const tools = await this.fetchTools(child, name, { handshakeTimeoutMs: 600_000 });
+    let tools: MCPTool[];
+    try {
+      await this.handshake(child, { timeoutMs: STDIO_HANDSHAKE_TIMEOUT_MS });
+      tools = await this.listToolsStdio(child, name, STDIO_HANDSHAKE_TIMEOUT_MS);
+      this.assertNoToolCollisions(name, tools);
+    } catch (err) {
+      // Never leak a half-initialised child.
+      this.disposeChild(child, err as Error);
+      throw err;
+    }
 
     this.active.set(name, {
       name,
       process: child,
       tools,
-      activatedAt: new Date()
+      activatedAt: new Date(),
+      spawnSig: sig,
+      toolTimeoutMs: config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
     });
 
-    console.error(`[router] ${name} activated with ${tools.length} tools`);
+    console.error(`${LOG_PREFIX} ${name} activated with ${tools.length} tools`);
+    this.reportTools(name, tools);
+    this.emitChanged();
     return tools;
+  }
+
+  // ── stdio message handling ───────────────────────────────────────────────
+
+  private handleChildMessage(name: string, child: ChildProcess, msg: JsonObject): void {
+    // Anything with a `method` is server → client traffic, never a response —
+    // even if its id happens to collide with one of our pending request ids.
+    if (typeof msg.method === "string") {
+      const hasId = msg.id !== undefined && msg.id !== null;
+      if (hasId) {
+        const reply = msg.method === "ping"
+          ? { jsonrpc: "2.0", id: msg.id, result: {} }
+          : { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `Method not found: ${msg.method}` } };
+        this.writeLine(child, reply);
+      } else if (msg.method === "notifications/tools/list_changed") {
+        void this.refreshStdioTools(name, child);
+      }
+      return;
+    }
+
+    const id = msg.id as number;
+    const pending = this.pendingRequests.get(child)?.get(id);
+    if (!pending) return;
+    this.pendingRequests.get(child)!.delete(id);
+    if (msg.error) {
+      pending.reject(toRpcError(msg.error as { message?: string; code?: number; data?: unknown }));
+    } else {
+      pending.resolve(msg.result);
+    }
+  }
+
+  private async refreshStdioTools(name: string, child: ChildProcess): Promise<void> {
+    if (this.active.get(name)?.process !== child) return;
+    try {
+      const tools = await this.listToolsStdio(child, name, DEFAULT_REQUEST_TIMEOUT_MS * 3);
+      const current = this.active.get(name);
+      if (current && current.process === child) {
+        current.tools = tools;
+        this.reportTools(name, tools);
+        this.emitChanged();
+      }
+    } catch (err) {
+      console.error(`${LOG_PREFIX} ${name}: tools/list refresh failed: ${(err as Error).message}`);
+    }
+  }
+
+  private writeLine(child: ChildProcess, payload: unknown): void {
+    try {
+      child.stdin?.write(JSON.stringify(payload) + "\n");
+    } catch {
+      /* the 'error' listener on stdin handles dead pipes */
+    }
+  }
+
+  private rejectPending(child: ChildProcess, err: Error): void {
+    const pending = this.pendingRequests.get(child);
+    if (!pending || pending.size === 0) return;
+    for (const { reject } of Array.from(pending.values())) reject(err);
+    pending.clear();
+  }
+
+  private forgetChild(child: ChildProcess): void {
+    this.stdoutBuffers.delete(child);
+    this.pendingRequests.delete(child);
+    this.requestIds.delete(child);
+  }
+
+  /** Reject outstanding requests, drop bookkeeping, and kill the process. */
+  private disposeChild(child: ChildProcess, reason: Error): void {
+    this.rejectPending(child, reason);
+    this.forgetChild(child);
+    try {
+      child.kill();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  private assertNoToolCollisions(name: string, tools: MCPTool[]): void {
+    const owners = new Map<string, string>();
+    for (const [other, s] of this.active) {
+      if (other !== name) for (const t of s.tools) owners.set(t.name, other);
+    }
+    for (const [other, s] of this.activeHttp) {
+      if (other !== name) for (const t of s.tools) owners.set(t.name, other);
+    }
+
+    const clashes: string[] = [];
+    for (const t of tools) {
+      if (this.reserved.has(t.name)) clashes.push(`${t.name} (reserved broker tool)`);
+      else if (owners.has(t.name)) clashes.push(`${t.name} (provided by "${owners.get(t.name)}")`);
+    }
+    if (clashes.length > 0) {
+      throw new Error(
+        `Cannot activate "${name}": tool name collision — ${clashes.join(", ")}. ` +
+          `Deactivate the other server first.`
+      );
+    }
+  }
+
+  // ── HTTP ─────────────────────────────────────────────────────────────────
+
+  private normalizeOAuthConfig(oauth: ServerConfig["oauth"]): OAuthConfig | undefined {
+    if (oauth === undefined || oauth === false) return undefined;
+    if (oauth === true) return {};
+    return oauth;
+  }
+
+  private async attachOAuth(
+    name: string,
+    url: string,
+    headers: Record<string, string>,
+    oauth: OAuthConfig | undefined,
+    force: boolean
+  ): Promise<OAuthConfig> {
+    const resolved = oauth ?? {};
+    const token = await getAccessToken(name, url, resolved, { force });
+    headers["Authorization"] = `Bearer ${token}`;
+    return resolved;
   }
 
   private async activateHttp(name: string, config: ServerConfig): Promise<MCPTool[]> {
     const url = config.url!;
-    const resolvedEnv = this.resolveEnv(config.env ?? {});
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const resolvedEnv = this.resolveEnv(config.env ?? {}, name);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: MCP_HTTP_ACCEPT,
+    };
 
     // Resolve ${VAR} in explicit headers
     for (const [k, v] of Object.entries(config.headers ?? {})) {
-      headers[k] = v.replace(/\$\{(\w+)\}/g, (_, n) => process.env[n] ?? resolvedEnv[n] ?? "");
+      headers[k] = this.expandVars(v, name, resolvedEnv);
     }
 
-    // OAuth PKCE flow — fetches/refreshes token automatically
-    if (config.oauth) {
-      const token = await getAccessToken(name, url, config.oauth);
-      headers["Authorization"] = `Bearer ${token}`;
+    const staticAuth = hasHeader(headers, "authorization");
+    const oauthAllowed = config.oauth !== false && !staticAuth;
+    let oauth = this.normalizeOAuthConfig(config.oauth);
+
+    // Explicit `oauth` config → authenticate up front. Otherwise only on a 401.
+    if (oauthAllowed && oauth !== undefined) {
+      oauth = await this.attachOAuth(name, url, headers, oauth, false);
     }
 
-    const tools = await this.fetchToolsHttp(url, headers, name);
+    let tools: MCPTool[];
+    try {
+      tools = await this.fetchToolsHttp(url, headers, name);
+    } catch (err) {
+      if (err instanceof HttpStatusError && err.status === 401 && oauthAllowed) {
+        console.error(`${LOG_PREFIX} ${name} returned 401 on activate — starting OAuth`);
+        oauth = await this.attachOAuth(name, url, headers, oauth, true);
+        tools = await this.fetchToolsHttp(url, headers, name);
+      } else {
+        throw err;
+      }
+    }
+
+    this.assertNoToolCollisions(name, tools);
 
     this.activeHttp.set(name, {
-      name, url, headers, tools, config,
+      name,
+      url,
+      headers,
+      tools,
+      config,
+      oauth,
+      staticAuth,
       activatedAt: new Date(),
       nextId: 1,
+      toolTimeoutMs: config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
     });
 
-    console.error(`[router] ${name} (http) activated with ${tools.length} tools`);
+    console.error(`${LOG_PREFIX} ${name} (http) activated with ${tools.length} tools`);
+    this.reportTools(name, tools);
+    this.emitChanged();
     return tools;
+  }
+
+  private async httpFetch(
+    serverName: string,
+    url: string,
+    init: RequestInit,
+    timeoutMs: number
+  ): Promise<Response> {
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      const e = err as Error;
+      if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+        throw new Error(`HTTP request to ${serverName} timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    }
   }
 
   async callTool(
@@ -169,12 +559,16 @@ export class ProcessManager {
 
     const child = server.process;
     const id = this.nextId(child);
-    return this.sendRequest(child, {
-      jsonrpc: "2.0",
-      id,
-      method: "tools/call",
-      params: { name: toolName, arguments: args }
-    }) as Promise<{ content: unknown[] }>;
+    return this.sendRequest(
+      child,
+      {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      },
+      server.toolTimeoutMs
+    ) as Promise<{ content: unknown[] }>;
   }
 
   private async callToolHttp(
@@ -184,52 +578,79 @@ export class ProcessManager {
   ): Promise<{ content: unknown[] }> {
     const id = server.nextId++;
     const body = JSON.stringify({
-      jsonrpc: "2.0", id,
+      jsonrpc: "2.0",
+      id,
       method: "tools/call",
       params: { name: toolName, arguments: args },
     });
+    const send = () =>
+      this.httpFetch(
+        server.name,
+        server.url,
+        { method: "POST", headers: server.headers, body },
+        server.toolTimeoutMs
+      );
 
-    let res = await fetch(server.url, { method: "POST", headers: server.headers, body });
+    let res = await send();
 
-    // On 401, attempt token refresh and retry once
-    if (res.status === 401 && server.config.oauth) {
-      console.error(`[router] ${server.name} returned 401 — refreshing OAuth token`);
-      const token = await getAccessToken(server.name, server.url, server.config.oauth);
-      server.headers["Authorization"] = `Bearer ${token}`;
-      res = await fetch(server.url, { method: "POST", headers: server.headers, body });
+    // 401: force a fresh token (never replay the rejected one), retry once.
+    // A user-supplied static Authorization header is never replaced.
+    if (res.status === 401 && server.config.oauth !== false && !server.staticAuth) {
+      console.error(`${LOG_PREFIX} ${server.name} returned 401 — refreshing OAuth token`);
+      server.oauth = await this.attachOAuth(
+        server.name,
+        server.url,
+        server.headers,
+        server.oauth ?? this.normalizeOAuthConfig(server.config.oauth),
+        true
+      );
+      res = await send();
     }
 
-    if (!res.ok) throw new Error(`HTTP ${res.status} from ${server.name}: ${await res.text()}`);
+    // 404 with a session id means the session expired: re-initialize, retry once.
+    if (res.status === 404 && server.headers["mcp-session-id"]) {
+      console.error(`${LOG_PREFIX} ${server.name} session expired — re-initializing`);
+      server.tools = await this.fetchToolsHttp(server.url, server.headers, server.name);
+      res = await send();
+    }
 
-    const data = await res.json() as { result?: { content: unknown[] }; error?: { message: string } };
-    if (data.error) throw new Error(data.error.message);
+    if (!res.ok) {
+      throw new HttpStatusError(res.status, server.name, await res.text());
+    }
+
+    const data = (await readMcpHttpResponse(res, id)) as {
+      result?: { content: unknown[] };
+      error?: { message: string; code?: number; data?: unknown };
+    };
+    if (data.error) throw toRpcError(data.error);
     return data.result ?? { content: [] };
   }
 
-  deactivate(name: string): void {
-    if (this.activeHttp.has(name)) {
+  deactivate(name: string): boolean {
+    const http = this.activeHttp.get(name);
+    if (http) {
       this.activeHttp.delete(name);
-      console.error(`[router] Deactivated server: ${name}`);
-      return;
+      const sessionId = http.headers["mcp-session-id"];
+      if (sessionId) {
+        // Best-effort session termination (spec: DELETE with the session id).
+        void Promise.resolve()
+          .then(() => fetch(http.url, { method: "DELETE", headers: { ...http.headers }, signal: AbortSignal.timeout(5000) }))
+          .catch(() => undefined);
+      }
+      console.error(`${LOG_PREFIX} Deactivated server: ${name}`);
+      this.emitChanged();
+      return true;
     }
 
     const server = this.active.get(name);
-    if (server) {
-      const child = server.process;
-      // Cancel any in-flight requests before killing the process
-      const pending = this.pendingRequests.get(child);
-      if (pending) {
-        const err = new Error(`Server "${name}" was deactivated`);
-        for (const { reject } of pending.values()) reject(err);
-        pending.clear();
-      }
-      this.stdoutBuffers.delete(child);
-      this.pendingRequests.delete(child);
-      this.requestIds.delete(child);
-      child.kill();
-      this.active.delete(name);
-      console.error(`[router] Deactivated server: ${name}`);
-    }
+    if (!server) return false;
+
+    // Remove first so the child's 'exit' handler doesn't treat this as a crash.
+    this.active.delete(name);
+    this.disposeChild(server.process, new Error(`Server "${name}" was deactivated`));
+    console.error(`${LOG_PREFIX} Deactivated server: ${name}`);
+    this.emitChanged();
+    return true;
   }
 
   listActive(): string[] {
@@ -262,13 +683,28 @@ export class ProcessManager {
     return id;
   }
 
-  private resolveEnv(env: Record<string, string>): Record<string, string> {
+  /** Replace ${VAR} from the process env (or the server's own env), warning on gaps. */
+  private expandVars(
+    value: string,
+    serverName: string,
+    fallback: Record<string, string> = {}
+  ): string {
+    return value.replace(/\$\{(\w+)\}/g, (_, varName: string) => {
+      const v = process.env[varName] ?? fallback[varName];
+      if (v === undefined) {
+        console.error(
+          `${LOG_PREFIX} warning: ${serverName} references \${${varName}} but it is not set in the environment`
+        );
+        return "";
+      }
+      return v;
+    });
+  }
+
+  private resolveEnv(env: Record<string, string>, serverName: string): Record<string, string> {
     const resolved: Record<string, string> = {};
     for (const [k, v] of Object.entries(env)) {
-      // Replace ${VAR} with process.env.VAR
-      resolved[k] = v.replace(/\$\{(\w+)\}/g, (_, varName) => {
-        return process.env[varName] ?? "";
-      });
+      resolved[k] = this.expandVars(v, serverName);
     }
     return resolved;
   }
@@ -278,64 +714,91 @@ export class ProcessManager {
     headers: Record<string, string>,
     serverName: string
   ): Promise<MCPTool[]> {
-    // MCP HTTP: initialize then tools/list
+    // Fresh handshake → drop any previous session / negotiated version.
+    delete headers["mcp-session-id"];
+    delete headers["MCP-Protocol-Version"];
+
     const initBody = JSON.stringify({
-      jsonrpc: "2.0", id: 1,
+      jsonrpc: "2.0",
+      id: 1,
       method: "initialize",
       params: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: "context-broker", version: "1.0.0" },
+        clientInfo: { name: "context-broker", version: VERSION },
       },
     });
 
-    const initRes = await fetch(url, { method: "POST", headers, body: initBody });
-    if (!initRes.ok) throw new Error(`HTTP ${initRes.status} initializing ${serverName}: ${await initRes.text()}`);
+    const post = (body: string) =>
+      this.httpFetch(serverName, url, { method: "POST", headers, body }, HTTP_HANDSHAKE_TIMEOUT_MS);
+
+    const initRes = await post(initBody);
+    if (!initRes.ok) {
+      throw new HttpStatusError(initRes.status, serverName, await initRes.text());
+    }
 
     // Persist session ID for all subsequent requests (required by some servers e.g. Datadog)
-    const sessionId = initRes.headers.get("mcp-session-id");
+    const sessionId = initRes.headers?.get("mcp-session-id");
     if (sessionId) headers["mcp-session-id"] = sessionId;
 
+    const initMsg = (await readMcpHttpResponse(initRes, 1).catch(() => undefined)) as
+      | { result?: { protocolVersion?: string }; error?: { message: string; code?: number; data?: unknown } }
+      | undefined;
+    if (initMsg?.error) throw toRpcError(initMsg.error);
+
+    // Required on every request after initialize (spec 2025-06-18+).
+    headers["MCP-Protocol-Version"] = initMsg?.result?.protocolVersion ?? PROTOCOL_VERSION;
+
     // Send initialized notification (some servers won't respond to tools/list without it)
-    const notifBody = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
-    await fetch(url, { method: "POST", headers, body: notifBody }).catch(() => {/* best-effort */});
+    const notifBody = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+      params: {},
+    });
+    try {
+      const notifRes = await post(notifBody);
+      await notifRes?.body?.cancel?.().catch?.(() => undefined);
+    } catch {
+      /* best-effort */
+    }
 
     type ToolsListResult = {
       tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
       nextCursor?: string;
     };
 
-    const allTools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [];
+    const allTools: ToolsListResult["tools"] = [];
     let cursor: string | undefined;
     let reqId = 2;
 
     do {
-      const listBody = JSON.stringify({
-        jsonrpc: "2.0", id: reqId++,
-        method: "tools/list",
-        params: cursor ? { cursor } : {},
-      });
+      const id = reqId++;
+      const listRes = await post(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/list",
+          params: cursor ? { cursor } : {},
+        })
+      );
+      if (!listRes.ok) {
+        throw new HttpStatusError(listRes.status, serverName, await listRes.text());
+      }
 
-      const listRes = await fetch(url, { method: "POST", headers, body: listBody });
-      if (!listRes.ok) throw new Error(`HTTP ${listRes.status} listing tools for ${serverName}`);
-
-      const data = await listRes.json() as { result?: ToolsListResult; error?: { message: string } };
-      if (data.error) throw new Error(data.error.message);
+      const data = (await readMcpHttpResponse(listRes, id)) as {
+        result?: ToolsListResult;
+        error?: { message: string; code?: number; data?: unknown };
+      };
+      if (data.error) throw toRpcError(data.error);
 
       allTools.push(...(data.result?.tools ?? []));
       cursor = data.result?.nextCursor;
     } while (cursor);
 
-    return allTools.map(t => ({ ...t, serverName }));
+    return allTools.map((t) => ({ ...t, serverName }));
   }
 
-  private async fetchTools(
-    child: ChildProcess,
-    serverName: string,
-    opts?: { handshakeTimeoutMs?: number }
-  ): Promise<MCPTool[]> {
-    const t = opts?.handshakeTimeoutMs ?? 10_000;
-    // Send MCP initialize handshake
+  private async handshake(child: ChildProcess, opts: { timeoutMs: number }): Promise<void> {
     await this.sendRequest(
       child,
       {
@@ -343,56 +806,59 @@ export class ProcessManager {
         id: this.nextId(child),
         method: "initialize",
         params: {
-          protocolVersion: "2024-11-05",
+          protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "context-broker", version: "1.0.0" }
-        }
+          clientInfo: { name: "context-broker", version: VERSION },
+        },
       },
-      t
+      opts.timeoutMs
     );
 
     // Required notification — some servers won't respond to tools/list without it
-    child.stdin?.write(JSON.stringify({
+    this.writeLine(child, {
       jsonrpc: "2.0",
       method: "notifications/initialized",
-      params: {}
-    }) + "\n");
+      params: {},
+    });
+  }
 
-    // Fetch tool list — follow nextCursor for paginated servers
+  /** tools/list, following nextCursor for paginated servers. */
+  private async listToolsStdio(
+    child: ChildProcess,
+    serverName: string,
+    timeoutMs: number
+  ): Promise<MCPTool[]> {
     type ToolsListResult = {
       tools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }>;
       nextCursor?: string;
     };
 
-    const allTools: Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> = [];
+    const allTools: ToolsListResult["tools"] = [];
     let cursor: string | undefined;
 
     do {
-      const result = await this.sendRequest(
+      const result = (await this.sendRequest(
         child,
         {
           jsonrpc: "2.0",
           id: this.nextId(child),
           method: "tools/list",
-          params: cursor ? { cursor } : {}
+          params: cursor ? { cursor } : {},
         },
-        t
-      ) as ToolsListResult;
+        timeoutMs
+      )) as ToolsListResult;
 
       allTools.push(...(result.tools ?? []));
       cursor = result.nextCursor;
     } while (cursor);
 
-    return allTools.map(t => ({
-      ...t,
-      serverName
-    }));
+    return allTools.map((t) => ({ ...t, serverName }));
   }
 
   private sendRequest(
     child: ChildProcess,
     request: Record<string, unknown>,
-    timeoutMs = 10_000
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = request.id as number;
@@ -401,16 +867,26 @@ export class ProcessManager {
         reject(new Error(`No pending map for child process (already deactivated?)`));
         return;
       }
-      childPending.set(id, { resolve, reject });
 
-      setTimeout(() => {
-        if (childPending.has(id)) {
-          childPending.delete(id);
-          reject(new Error(`Request ${id} timed out after ${timeoutMs}ms`));
+      const timer = setTimeout(() => {
+        if (childPending.delete(id)) {
+          reject(new Error(`Request ${id} (${String(request.method)}) timed out after ${timeoutMs}ms`));
         }
-      }, timeoutMs).unref();
+      }, timeoutMs);
+      timer.unref();
 
-      child.stdin?.write(JSON.stringify(request) + "\n");
+      childPending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+
+      this.writeLine(child, request);
     });
   }
 }
