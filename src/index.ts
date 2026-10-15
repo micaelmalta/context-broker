@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // src/index.ts
-// MCP Broker - exposes meta-tools to Claude Code,
+// lazygate - exposes meta-tools to Claude Code,
 // lazily activates real MCP servers on demand
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -8,8 +8,6 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool,
-  ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync, existsSync } from "fs";
 import { resolve, dirname } from "path";
@@ -18,7 +16,13 @@ import { fileURLToPath } from "url";
 import { spawnSync } from "child_process";
 import { ToolRouter, ServerConfig } from "./router.js";
 import { ProcessManager } from "./process-manager.js";
-import { SkillRouter, SkillConfig } from "./skill-router.js";
+import { SkillRouter } from "./skill-router.js";
+import { parseServersConfig, parseSkillsConfig, reportConfigErrors } from "./config.js";
+import { createBroker } from "./broker.js";
+import { META_TOOL_NAMES } from "./meta-tools.js";
+import { ToolIndex } from "./tool-index.js";
+import { adoptLegacyConfigDir, configDir, APP_NAME } from "./paths.js";
+import { VERSION, LOG_PREFIX } from "./version.js";
 
 // ─── Subcommand dispatch ────────────────────────────────────────────────────
 
@@ -43,387 +47,109 @@ if (subcommand && SUBCOMMANDS[subcommand]) {
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
-function resolveConfigPath(): string {
-  // --config /path/to/servers.json
-  const flagIdx = process.argv.indexOf("--config");
+// Pick up a config directory from before the rename (context-broker → lazygate).
+adoptLegacyConfigDir();
+
+/**
+ * Resolution: --<flag> <path> → ~/.config/lazygate/<file>.
+ * The bundled config/ directory only holds *examples* and is never loaded
+ * implicitly (its paths don't exist on real machines).
+ */
+function resolveConfigPath(flag: string, file: string): string | null {
+  const flagIdx = process.argv.indexOf(flag);
   if (flagIdx !== -1 && process.argv[flagIdx + 1]) {
     const p = resolve(process.argv[flagIdx + 1]);
     if (!existsSync(p)) throw new Error(`Config file not found: ${p}`);
     return p;
   }
 
-  // ~/.config/context-broker/servers.json
-  const xdg = resolve(homedir(), ".config", "context-broker", "servers.json");
-  if (existsSync(xdg)) return xdg;
+  const xdg = resolve(configDir(), file);
+  return existsSync(xdg) ? xdg : null;
+}
 
-  // fallback: bundled config (dev / local clone)
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-  const local = resolve(__dirname, "../config/servers.json");
-  if (existsSync(local)) return local;
+function loadJson(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch (err) {
+    throw new Error(`Could not read ${path}: ${(err as Error).message}`);
+  }
+}
 
-  throw new Error(
-    `No config found. Create ~/.config/context-broker/servers.json or pass --config <path>.`
+const configPath = resolveConfigPath("--config", "servers.json");
+let serverConfigs: Record<string, ServerConfig> = {};
+if (configPath) {
+  const { entries, errors } = parseServersConfig(loadJson(configPath), configPath);
+  serverConfigs = entries;
+  reportConfigErrors(errors);
+  console.error(`${LOG_PREFIX} Config: ${configPath} (${Object.keys(entries).length} servers)`);
+} else {
+  console.error(
+    `${LOG_PREFIX} No servers.json found. Create ~/.config/lazygate/servers.json ` +
+      `(see config/servers.json in the repo for an example) or pass --config <path>. ` +
+      `Starting with an empty registry.`
   );
 }
 
-const configPath = resolveConfigPath();
-const config = JSON.parse(readFileSync(configPath, "utf-8"));
-const serverConfigs: Record<string, ServerConfig> = config.servers;
-console.error(`[context-broker] Config: ${configPath}`);
-
-const router = new ToolRouter(serverConfigs);
-const manager = new ProcessManager();
+const toolIndex = new ToolIndex(resolve(configDir(), "tool-index.json"));
+const router = new ToolRouter(serverConfigs, configPath ?? undefined, toolIndex);
 
 // ─── Skills ────────────────────────────────────────────────────────────────
 
-function resolveSkillsConfigPath(): string | null {
-  const flagIdx = process.argv.indexOf("--skills");
-  if (flagIdx !== -1 && process.argv[flagIdx + 1]) {
-    const p = resolve(process.argv[flagIdx + 1]);
-    if (!existsSync(p)) throw new Error(`Skills config not found: ${p}`);
-    return p;
-  }
-
-  const xdg = resolve(homedir(), ".config", "context-broker", "skills.json");
-  if (existsSync(xdg)) return xdg;
-
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-  const local = resolve(__dirname, "../config/skills.json");
-  if (existsSync(local)) return local;
-
-  return null;
-}
-
-const skillsConfigPath = resolveSkillsConfigPath();
-const skillRouter = skillsConfigPath
-  ? new SkillRouter(
-      (JSON.parse(readFileSync(skillsConfigPath, "utf-8")) as { skills: Record<string, SkillConfig> }).skills
-    )
-  : null;
-
+const skillsConfigPath = resolveConfigPath("--skills", "skills.json");
+let skillRouter: SkillRouter | null = null;
 if (skillsConfigPath) {
-  console.error(`[context-broker] Skills config: ${skillsConfigPath}`);
-}
-
-// ─── Meta-tools always exposed ─────────────────────────────────────────────
-
-const META_TOOLS: Tool[] = [
-  {
-    name: "discover_tools",
-    description:
-      "Find which tool servers are available and relevant for a task. " +
-      "Call this first when you need a capability you don't have yet.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Describe what you want to do"
-        }
-      },
-      required: ["query"]
-    }
-  },
-  {
-    name: "activate_server",
-    description:
-      "Load and connect a tool server, making its tools available. " +
-      "Call discover_tools first to find the right server name.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        server_name: {
-          type: "string",
-          description: "Name of the server to activate"
-        }
-      },
-      required: ["server_name"]
-    }
-  },
-  {
-    name: "deactivate_server",
-    description: "Shut down a tool server to free resources.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        server_name: {
-          type: "string",
-          description: "Name of the server to deactivate"
-        }
-      },
-      required: ["server_name"]
-    }
-  },
-  {
-    name: "list_active_servers",
-    description: "Show which servers are currently active and their tools.",
-    inputSchema: {
-      type: "object",
-      properties: {}
-    }
-  },
-  {
-    name: "discover_skill",
-    description:
-      "Find the right skill for a task before executing it. " +
-      "Call this at the start of any task that produces a file or " +
-      "requires specialist knowledge.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "What you are trying to do" }
-      },
-      required: ["query"]
-    }
-  },
-  {
-    name: "load_skill",
-    description: "Load a skill's full instructions into context.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        skill_name: { type: "string", description: "Name returned by discover_skill" }
-      },
-      required: ["skill_name"]
-    }
+  try {
+    const { entries, errors } = parseSkillsConfig(loadJson(skillsConfigPath), skillsConfigPath);
+    reportConfigErrors(errors);
+    skillRouter = new SkillRouter(entries, skillsConfigPath);
+    console.error(`${LOG_PREFIX} Skills config: ${skillsConfigPath} (${Object.keys(entries).length} skills)`);
+  } catch (err) {
+    // A half-written skills.json must not stop the broker; it is re-read lazily.
+    console.error(`${LOG_PREFIX} ${(err as Error).message} — will retry on first use`);
+    skillRouter = new SkillRouter({}, skillsConfigPath);
   }
-];
+}
 
 // ─── MCP Server ────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "context-broker", version: "1.0.0" },
+  { name: APP_NAME, version: VERSION },
   { capabilities: { tools: { listChanged: true } } }
 );
 
-// List tools: meta-tools + all tools from active servers
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const activeTools = manager.getAllActiveTools().map(t => ({
-    name: t.name,
-    description: `[${t.serverName}] ${t.description}`,
-    inputSchema: t.inputSchema
-  }));
+let connected = false;
 
-  return { tools: [...META_TOOLS, ...activeTools] };
+/** Tell the client the tool list changed so it re-fetches and can call tools directly. */
+function notifyToolsChanged(): void {
+  if (!connected) return;
+  server.sendToolListChanged().catch(() => {
+    /* transport closed during shutdown */
+  });
+}
+
+const manager = new ProcessManager({
+  onToolsChanged: notifyToolsChanged,
+  reservedToolNames: META_TOOL_NAMES,
+  // Learn what each server's tools do, so discover_tools can route by them later.
+  onServerTools: (name, tools) => {
+    const cfg = router.getConfig(name);
+    if (cfg) toolIndex.record(name, cfg, tools);
+  },
 });
 
-// Handle tool calls
+const broker = createBroker({ router, manager, skillRouter });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => broker.listTools());
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-
-  // ── Meta-tool: discover ──────────────────────────────────────────────────
-  if (name === "discover_tools") {
-    const query = args?.query as string;
-    const ranked = router.rank(query);
-
-    if (ranked.length === 0) {
-      return {
-        content: [{
-          type: "text",
-          text: `No matching servers found for: "${query}"\n\nAvailable servers:\n` +
-            router.listAll().map(n => {
-              const cfg = router.getConfig(n)!;
-              return `• ${n}: ${cfg.description}`;
-            }).join("\n")
-        }]
-      };
-    }
-
-    const active = manager.listActive();
-    const lines = ranked.map(r => {
-      const cfg = router.getConfig(r.name)!;
-      const status = active.includes(r.name) ? "✓ active" : "○ inactive";
-      return `${status} | ${r.name} (score: ${r.score})\n  ${cfg.description}\n  Keywords matched: ${r.reason.join(", ")}`;
-    });
-
-    return {
-      content: [{
-        type: "text",
-        text: `Servers relevant to "${query}":\n\n${lines.join("\n\n")}\n\n` +
-          `Use activate_server to load an inactive server.`
-      }]
-    };
-  }
-
-  // ── Meta-tool: activate ──────────────────────────────────────────────────
-  if (name === "activate_server") {
-    const serverName = args?.server_name as string;
-    const cfg = router.getConfig(serverName);
-
-    if (!cfg) {
-      return {
-        content: [{
-          type: "text",
-          text: `Unknown server: "${serverName}". ` +
-            `Available: ${router.listAll().join(", ")}`
-        }]
-      };
-    }
-
-    try {
-      const tools = await manager.activate(serverName, cfg);
-      // Tell Claude Code the tool list changed so it re-fetches and can call them directly
-      await server.notification({ method: "notifications/tools/list_changed", params: {} });
-      return {
-        content: [{
-          type: "text",
-          text: `✓ Activated "${serverName}" with ${tools.length} tools:\n` +
-            tools.map(t => `  • ${t.name}: ${t.description}`).join("\n")
-        }]
-      };
-    } catch (err) {
-      return {
-        content: [{
-          type: "text",
-          text: `Failed to activate "${serverName}": ${(err as Error).message}`
-        }]
-      };
-    }
-  }
-
-  // ── Meta-tool: deactivate ────────────────────────────────────────────────
-  if (name === "deactivate_server") {
-    const serverName = args?.server_name as string;
-    manager.deactivate(serverName);
-    return {
-      content: [{ type: "text", text: `Deactivated "${serverName}"` }]
-    };
-  }
-
-  // ── Meta-tool: list active ───────────────────────────────────────────────
-  if (name === "list_active_servers") {
-    const active = manager.listActive();
-    if (active.length === 0) {
-      return {
-        content: [{ type: "text", text: "No servers currently active." }]
-      };
-    }
-
-    const lines = active.map(n => {
-      const tools = manager.getAllActiveTools()
-        .filter(t => t.serverName === n)
-        .map(t => `    • ${t.name}`)
-        .join("\n");
-      return `${n}:\n${tools}`;
-    });
-
-    return {
-      content: [{ type: "text", text: lines.join("\n\n") }]
-    };
-  }
-
-  // ── Meta-tool: discover_skill ────────────────────────────────────────────
-  if (name === "discover_skill") {
-    if (!skillRouter) {
-      return {
-        content: [{ type: "text", text: "No skills registry configured." }]
-      };
-    }
-
-    const query = args?.query as string;
-    const ranked = skillRouter.rank(query);
-
-    if (ranked.length === 0) {
-      return {
-        content: [{
-          type: "text",
-          text: `No matching skills found for: "${query}"\n\nAvailable skills:\n` +
-            skillRouter.listAll().map(n => {
-              const cfg = skillRouter.getConfig(n)!;
-              return `• ${n}: ${cfg.description}`;
-            }).join("\n")
-        }]
-      };
-    }
-
-    const lines = ranked.map(r => {
-      const cfg = skillRouter.getConfig(r.name)!;
-      return `${r.name} (score: ${r.score})\n  ${cfg.description}\n  Keywords matched: ${r.reason.join(", ")}`;
-    });
-
-    return {
-      content: [{
-        type: "text",
-        text: `Skills relevant to "${query}":\n\n${lines.join("\n\n")}\n\n` +
-          `Use load_skill to load a skill's full instructions.`
-      }]
-    };
-  }
-
-  // ── Meta-tool: load_skill ────────────────────────────────────────────────
-  if (name === "load_skill") {
-    if (!skillRouter) {
-      return {
-        content: [{ type: "text", text: "No skills registry configured." }]
-      };
-    }
-
-    const skillName = args?.skill_name as string;
-    try {
-      const content = skillRouter.load(skillName);
-      return {
-        content: [{
-          type: "text",
-          text: `# Skill: ${skillName}\n\n${content}`
-        }]
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: (err as Error).message }]
-      };
-    }
-  }
-
-  // ── Proxy to active server ───────────────────────────────────────────────
-  const serverName = manager.findServerForTool(name);
-  if (!serverName) {
-    // Auto-discover and activate if possible
-    const candidates = router.select(name, 1);
-    if (candidates.length > 0) {
-      const cfg = router.getConfig(candidates[0])!;
-      await manager.activate(candidates[0], cfg);
-      const retryServer = manager.findServerForTool(name);
-      if (retryServer) {
-        return await manager.callTool(retryServer, name, (args ?? {}) as Record<string, unknown>);
-      }
-    }
-
-    return {
-      content: [{
-        type: "text",
-        text: `Tool "${name}" not found. Use discover_tools to find and activate the right server.`
-      }]
-    };
-  }
-
-  try {
-    return await manager.callTool(serverName, name, (args ?? {}) as Record<string, unknown>);
-  } catch (err) {
-    return {
-      content: [{
-        type: "text",
-        text: `Error calling ${name}: ${(err as Error).message}`
-      }]
-    };
-  }
+  return broker.callTool(name, args as Record<string, unknown> | undefined);
 });
-
-// ─── Auto-activate servers marked autoActivate: true ──────────────────────
-
-for (const [name, cfg] of Object.entries(serverConfigs)) {
-  if (cfg.autoActivate) {
-    try {
-      await manager.activate(name, cfg);
-      await server.notification({ method: "notifications/tools/list_changed", params: {} });
-    } catch (err) {
-      console.error(`[context-broker] Failed to auto-activate "${name}": ${(err as Error).message}`);
-    }
-  }
-}
 
 // ─── Graceful shutdown ──────────────────────────────────────────────────────
 
 function shutdown() {
+  connected = false;
   for (const name of manager.listActive()) {
     manager.deactivate(name);
   }
@@ -435,6 +161,17 @@ process.on("SIGTERM", shutdown);
 
 // ─── Start ──────────────────────────────────────────────────────────────────
 
+// Connect first: auto-activation can take minutes (docker build, OAuth) and
+// notifications require a live transport.
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[context-broker] Running on stdio");
+connected = true;
+console.error(`${LOG_PREFIX} Running on stdio`);
+
+// Auto-activate servers marked autoActivate: true (in the background)
+for (const [name, cfg] of Object.entries(serverConfigs)) {
+  if (!cfg.autoActivate) continue;
+  manager.activate(name, cfg).catch((err) => {
+    console.error(`${LOG_PREFIX} Failed to auto-activate "${name}": ${(err as Error).message}`);
+  });
+}

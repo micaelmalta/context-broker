@@ -1,10 +1,18 @@
 #!/usr/bin/env node
 // Reverts a previous `migrate.mjs` run:
-//   - Removes entries from ~/.config/context-broker/servers.json whose description
-//     matches "Migrated from <source>" and restores them to the source config
+//   - Removes entries from ~/.config/lazygate/servers.json that `migrate` created
+//     (identified by `migratedFrom`, or the legacy "Migrated from <source>" description)
+//     and restores them to the source config in that client's own format
+//   - Re-enables exactly the plugins that `migrate` disabled
 //   - Removes skill/command entries from skills.json (identified by migratedFrom or plugin)
 //     and merges INSTRUCTIONS.md back into SKILL.md in-place
 //   - Removes the SessionStart session-sync hook from ~/.claude/settings.json
+//   - Removes the lazygate (or legacy context-broker) entry that migrate added to a restored client's config
+//     (Cursor, OpenCode), and from ~/.claude.json only once no migrated servers remain
+// Every modified config file is backed up first (<file>.bak-<timestamp>).
+//
+// Note: secrets that `migrate` extracted into your shell config file are left in
+// place (other tools may rely on them); remove them manually if you no longer need them.
 //
 // Usage:
 //   node scripts/revert-migration.mjs                        # reverts all sources
@@ -12,16 +20,28 @@
 //   node scripts/revert-migration.mjs --from claude
 //   node scripts/revert-migration.mjs --from opencode
 //   node scripts/revert-migration.mjs --from agents
+//   node scripts/revert-migration.mjs --from plugin          # servers that came from plugins
 //   node scripts/revert-migration.mjs --from /path/to/file   (uses the basename as marker)
 //   node scripts/revert-migration.mjs --config /custom/servers.json
 //   node scripts/revert-migration.mjs --skills-config /custom/skills.json
 //   node scripts/revert-migration.mjs --plugins
 //   node scripts/revert-migration.mjs --dry-run
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
-import { resolve, basename } from "path";
-import { execSync } from "child_process";
+import { existsSync } from "fs";
+import { resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import {
+  readJsonFile,
+  writeJsonSafe,
+  findFiles,
+  mergeInstructions,
+  toCursorVars,
+  mapStrings,
+  APP_NAME,
+  activeConfigDir,
+  adoptLegacyConfigDir,
+  removeBrokerEntries,
+} from "./lib/shared.mjs";
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
 
@@ -35,6 +55,10 @@ const skillsConfigArg = get("--skills-config");
 const dryRun          = has("--dry-run");
 const explicitSkills  = has("--skills");
 const explicitPlugins = has("--plugins");
+// Pick up a config dir from before the rename (not on --dry-run, which writes nothing).
+if (!has("--dry-run")) adoptLegacyConfigDir();
+const CONFIG_DIR = activeConfigDir();
+
 const revertServers   = !explicitSkills && !explicitPlugins || has("--servers");
 const revertSkills    = explicitSkills  || (!explicitPlugins && !has("--servers"));
 const revertPlugins   = explicitPlugins || (!explicitSkills  && !has("--servers"));
@@ -47,28 +71,48 @@ const SERVER_SOURCES = {
   opencode: resolve(homedir(), ".config", "opencode", "opencode.json"),
 };
 
-const SKILLS_SOURCES = {
-  claude:   resolve(homedir(), ".claude", "skills"),
-  cursor:   resolve(homedir(), ".cursor", "skills"),
-  opencode: resolve(homedir(), ".config", "opencode", "skills"),
-  agents:   resolve(homedir(), ".agents", "skills"),
-};
+// Labels that can appear in `migratedFrom` (session-sync labels its own dir "broker").
+const ALL_LABELS = ["cursor", "claude", "opencode", "agents", "plugin", "broker"];
 
 function resolveLabels() {
   if (fromArg) return [fromArg];
-  return Object.keys({ ...SERVER_SOURCES, ...SKILLS_SOURCES })
-    .filter((v, i, a) => a.indexOf(v) === i); // unique
+  return ALL_LABELS;
 }
 
-// Merge INSTRUCTIONS.md back into SKILL.md at the given SKILL.md path.
-function mergeInstructions(skillPath) {
-  const instructionsPath = skillPath.replace(/SKILL\.md$/, "INSTRUCTIONS.md");
-  if (!existsSync(instructionsPath) || !existsSync(skillPath)) return false;
-  const stub = readFileSync(skillPath, "utf-8");
-  const body = readFileSync(instructionsPath, "utf-8");
-  writeFileSync(skillPath, (stub.endsWith("\n") ? stub : stub + "\n") + "\n" + body);
-  unlinkSync(instructionsPath);
-  return true;
+const settingsPath = resolve(homedir(), ".claude", "settings.json");
+const claudeJsonPath = resolve(homedir(), ".claude.json");
+
+// Write one server back in the format its source client uses.
+function toSourceFormat(label, sourcePath, cfg) {
+  const isOpenCode = label === "opencode" || basename(sourcePath) === "opencode.json";
+  const isCursor = label === "cursor" || basename(dirname(sourcePath)) === ".cursor";
+  const fix = isCursor ? (v) => mapStrings(v, toCursorVars) : (v) => v;
+  const isHttp = cfg.type === "http" || cfg.url;
+  const hasEnv = cfg.env && Object.keys(cfg.env).length > 0;
+
+  if (isOpenCode) {
+    if (isHttp) {
+      const e = { type: "remote", url: cfg.url };
+      if (cfg.oauth)   e.oauth = cfg.oauth;
+      if (cfg.headers) e.headers = cfg.headers;
+      if (hasEnv)      e.environment = cfg.env;
+      return { key: "mcp", entry: e };
+    }
+    const e = { type: "local", command: [cfg.command, ...(cfg.args ?? [])] };
+    if (hasEnv) e.environment = cfg.env;
+    return { key: "mcp", entry: e };
+  }
+
+  if (isHttp) {
+    const e = { type: "http", url: fix(cfg.url) };
+    if (cfg.oauth)   e.oauth = cfg.oauth;
+    if (cfg.headers) e.headers = fix(cfg.headers);
+    if (hasEnv)      e.env = fix(cfg.env);
+    return { key: "mcpServers", entry: e };
+  }
+  const e = { command: fix(cfg.command), args: fix(cfg.args ?? []) };
+  if (hasEnv) e.env = fix(cfg.env);
+  return { key: "mcpServers", entry: e };
 }
 
 // ─── Servers revert ────────────────────────────────────────────────────────
@@ -76,84 +120,98 @@ function mergeInstructions(skillPath) {
 if (revertServers) {
   const serversPath = configArg
     ? resolve(configArg)
-    : resolve(homedir(), ".config", "context-broker", "servers.json");
+    : resolve(CONFIG_DIR, "servers.json");
+
+  let remainingCount = null; // unknown until servers.json is read
 
   if (!existsSync(serversPath)) {
     console.log(`\n⚠  servers.json not found: ${serversPath} — skipping servers revert.`);
+    remainingCount = 0;
   } else {
-    const allServers = JSON.parse(readFileSync(serversPath, "utf-8")).servers ?? {};
+    const serversFile = readJsonFile(serversPath);
+    const allServers = serversFile.servers ?? {};
 
     if (Object.keys(allServers).length === 0) {
       console.log(`\nServers: servers.json is empty — nothing to revert.`);
+      remainingCount = 0;
     } else {
-      const labels = resolveLabels();
+      const settings = readJsonFile(settingsPath, null);
+      const pluginsToEnable = new Set();
 
-      for (const label of labels) {
+      for (const label of resolveLabels()) {
         const sourcePath = SERVER_SOURCES[label] ?? resolve(label);
-        const toRestore = Object.entries(allServers)
-          .filter(([, cfg]) => cfg.description === `Migrated from ${label}`);
+        const toRestore = Object.entries(allServers).filter(
+          ([, cfg]) => cfg.migratedFrom === label || cfg.description === `Migrated from ${label}`
+        );
 
         if (toRestore.length === 0) {
-          console.log(`\nServers (${label}): no entries with that migration label — skipping.`);
+          if (fromArg) console.log(`\nServers (${label}): no entries with that migration label — skipping.`);
           continue;
         }
 
-        const mcpServers = {};
+        const restoredByKey = {};
         for (const [name, cfg] of toRestore) {
-          if (cfg.type === "http" || cfg.url) {
-            const entry = { type: "http", url: cfg.url };
-            if (cfg.oauth)   entry.oauth   = cfg.oauth;
-            if (cfg.headers) entry.headers = cfg.headers;
-            if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
-            mcpServers[name] = entry;
-          } else {
-            const entry = { command: cfg.command, args: cfg.args ?? [] };
-            if (cfg.env && Object.keys(cfg.env).length > 0) entry.env = cfg.env;
-            mcpServers[name] = entry;
+          // Plugin-shipped servers have no config file of their own — re-enabling the plugin restores them.
+          if (label !== "plugin") {
+            const { key, entry } = toSourceFormat(label, sourcePath, cfg);
+            (restoredByKey[key] ??= {})[name] = entry;
+          }
+
+          // Re-enable exactly the plugins migrate disabled (legacy entries: HTTP servers by name).
+          if (cfg.disabledPlugins) {
+            cfg.disabledPlugins.forEach((k) => pluginsToEnable.add(k));
+          } else if (cfg.description === `Migrated from ${label}` && (cfg.type === "http" || cfg.url)) {
+            for (const pluginKey of Object.keys(settings?.enabledPlugins ?? {})) {
+              if (pluginKey.split("@")[0] === name) pluginsToEnable.add(pluginKey);
+            }
           }
           delete allServers[name];
         }
 
-        console.log(`\nServers (${label}): restoring ${Object.keys(mcpServers).length} entries to ${sourcePath}`);
-
-        if (dryRun) {
-          console.log(JSON.stringify({ mcpServers }, null, 2));
+        if (label === "plugin") {
+          console.log(`\nServers (plugin): removing ${toRestore.length} plugin-provided entries (plugins re-enabled below)`);
         } else {
-          const sourceRaw = existsSync(sourcePath) ? JSON.parse(readFileSync(sourcePath, "utf-8")) : {};
-          sourceRaw.mcpServers = { ...(sourceRaw.mcpServers ?? {}), ...mcpServers };
-          writeFileSync(sourcePath, JSON.stringify(sourceRaw, null, 2) + "\n");
-          console.log(`✓ Written: ${sourcePath}`);
-
-          // Re-enable plugins that were disabled during migration
-          const settingsPath = resolve(homedir(), ".claude", "settings.json");
-          if (existsSync(settingsPath)) {
-            const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-            const plugins = settings.enabledPlugins ?? {};
-            const httpNames = new Set(
-              Object.entries(mcpServers)
-                .filter(([, cfg]) => cfg.type === "http" || cfg.url)
-                .map(([name]) => name)
-            );
-            let enabledCount = 0;
-            for (const pluginKey of Object.keys(plugins)) {
-              const pluginName = pluginKey.split("@")[0];
-              if (httpNames.has(pluginName) && plugins[pluginKey] === false) {
-                plugins[pluginKey] = true;
-                enabledCount++;
+          console.log(`\nServers (${label}): restoring ${toRestore.length} entries to ${sourcePath}`);
+          if (dryRun) {
+            console.log(JSON.stringify(restoredByKey, null, 2));
+          } else {
+            const sourceRaw = readJsonFile(sourcePath, {});
+            for (const [key, entries] of Object.entries(restoredByKey)) {
+              sourceRaw[key] = { ...(sourceRaw[key] ?? {}), ...entries };
+            }
+            // This client's servers are back, so it no longer needs the broker
+            // (~/.claude.json is handled separately below).
+            if (resolve(sourcePath) !== claudeJsonPath) {
+              for (const key of ["mcpServers", "mcp"]) {
+                if (removeBrokerEntries(sourceRaw[key])) {
+                  console.log(`✓ Removed ${APP_NAME} from ${sourcePath}`);
+                }
               }
             }
-            if (enabledCount > 0) {
-              writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-              console.log(`✓ Re-enabled ${enabledCount} plugin(s) in ${settingsPath}`);
-            }
+            writeJsonSafe(sourcePath, sourceRaw);
+            console.log(`✓ Written: ${sourcePath}`);
           }
         }
       }
 
+      if (settings && pluginsToEnable.size > 0) {
+        const plugins = settings.enabledPlugins ?? {};
+        const enabling = [...pluginsToEnable].filter((k) => plugins[k] === false);
+        if (enabling.length > 0) {
+          if (dryRun) {
+            console.log(`  Would re-enable ${enabling.length} plugin(s) in ${settingsPath}`);
+          } else {
+            enabling.forEach((k) => { plugins[k] = true; });
+            writeJsonSafe(settingsPath, settings);
+            console.log(`✓ Re-enabled ${enabling.length} plugin(s) in ${settingsPath}`);
+          }
+        }
+      }
+
+      remainingCount = Object.keys(allServers).length;
       if (!dryRun) {
-        const serversFile = JSON.parse(readFileSync(serversPath, "utf-8"));
         serversFile.servers = allServers;
-        writeFileSync(serversPath, JSON.stringify(serversFile, null, 2) + "\n");
+        writeJsonSafe(serversPath, serversFile);
         console.log(`✓ Updated: ${serversPath}`);
       } else {
         console.log("\n--- servers.json after revert (dry run) ---");
@@ -163,21 +221,23 @@ if (revertServers) {
     }
   }
 
-  // ─── Remove context-broker router from ~/.claude.json ───────────────────
-  const claudeJsonPath = resolve(homedir(), ".claude.json");
+  // ─── Remove the broker from ~/.claude.json ───────────────────
+  // Only once nothing migrated is left behind it — otherwise the remaining
+  // servers would become unreachable.
   if (existsSync(claudeJsonPath)) {
-    if (dryRun) {
+    if (remainingCount !== 0) {
+      console.log(`\n  Keeping ${APP_NAME} in ${claudeJsonPath} — ${remainingCount ?? "some"} server(s) still managed by the broker`);
+    } else if (dryRun) {
       console.log(`\n--- ~/.claude.json broker removal (dry run) ---`);
-      console.log(`  Would remove "context-broker" from mcpServers`);
+      console.log(`  Would remove "${APP_NAME}" from mcpServers`);
       console.log("--- (not written) ---");
     } else {
-      const claudeJson = JSON.parse(readFileSync(claudeJsonPath, "utf-8"));
-      if (claudeJson.mcpServers?.["context-broker"]) {
-        delete claudeJson.mcpServers["context-broker"];
-        writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
-        console.log(`✓ Removed context-broker from ${claudeJsonPath}`);
+      const claudeJson = readJsonFile(claudeJsonPath, {});
+      if (removeBrokerEntries(claudeJson.mcpServers)) {
+        writeJsonSafe(claudeJsonPath, claudeJson);
+        console.log(`✓ Removed ${APP_NAME} from ${claudeJsonPath}`);
       } else {
-        console.log(`  context-broker not found in ${claudeJsonPath} — skipped`);
+        console.log(`  ${APP_NAME} not found in ${claudeJsonPath} — skipped`);
       }
     }
   }
@@ -190,17 +250,15 @@ if (revertServers) {
 if (revertSkills) {
   const skillsPath = skillsConfigArg
     ? resolve(skillsConfigArg)
-    : resolve(homedir(), ".config", "context-broker", "skills.json");
+    : resolve(CONFIG_DIR, "skills.json");
 
   if (!existsSync(skillsPath)) {
     console.log(`\n⚠  skills.json not found: ${skillsPath} — skipping skills revert.`);
   } else {
-    const skillsFile = JSON.parse(readFileSync(skillsPath, "utf-8"));
-    const skills = skillsFile.skills ?? {};
-    const labels = resolveLabels();
+    const skills = readJsonFile(skillsPath).skills ?? {};
     let anyFound = false;
 
-    for (const label of labels) {
+    for (const label of resolveLabels()) {
       const toRemove = Object.entries(skills)
         .filter(([, cfg]) => cfg.migratedFrom === label)
         .map(([name]) => name);
@@ -232,7 +290,7 @@ if (revertSkills) {
     if (!anyFound) {
       console.log(`\nSkills: no entries with a known migratedFrom label — nothing to revert.`);
     } else if (!dryRun) {
-      writeFileSync(skillsPath, JSON.stringify({ skills }, null, 2) + "\n");
+      writeJsonSafe(skillsPath, { skills });
       console.log(`✓ Written: ${skillsPath}`);
     } else {
       console.log("\n--- skills.json after revert (dry run) ---");
@@ -249,24 +307,20 @@ if (revertSkills) {
 if (revertPlugins) {
   const skillsPath = skillsConfigArg
     ? resolve(skillsConfigArg)
-    : resolve(homedir(), ".config", "context-broker", "skills.json");
+    : resolve(CONFIG_DIR, "skills.json");
 
   const pluginsCache = resolve(homedir(), ".claude", "plugins", "cache");
 
   if (!existsSync(skillsPath)) {
     console.log(`\n⚠  skills.json not found: ${skillsPath} — skipping plugins revert.`);
   } else {
-    const skillsFile = JSON.parse(readFileSync(skillsPath, "utf-8"));
-    const skills = skillsFile.skills ?? {};
-
+    const skills = readJsonFile(skillsPath).skills ?? {};
     const pluginEntries = Object.entries(skills).filter(([, cfg]) => cfg.plugin);
 
     // Always scan for INSTRUCTIONS.md files — registry may be out of sync with file state
-    let instructionsFiles = [];
-    try {
-      instructionsFiles = execSync(`find "${pluginsCache}" -name "INSTRUCTIONS.md"`, { encoding: "utf-8" })
-        .trim().split("\n").filter(Boolean);
-    } catch { /* no cache */ }
+    const instructionsFiles = existsSync(pluginsCache)
+      ? findFiles(pluginsCache, { name: "INSTRUCTIONS.md", type: "file", maxDepth: 10 })
+      : [];
 
     if (pluginEntries.length === 0 && instructionsFiles.length === 0) {
       console.log(`\nPlugins: no plugin entries in skills.json and no INSTRUCTIONS.md files found — nothing to revert.`);
@@ -288,21 +342,20 @@ if (revertPlugins) {
         const remaining = Object.fromEntries(
           Object.entries(skills).filter(([, cfg]) => !cfg.plugin)
         );
-        writeFileSync(skillsPath, JSON.stringify({ skills: remaining }, null, 2) + "\n");
+        writeJsonSafe(skillsPath, { skills: remaining });
         if (restored > 0) console.log(`✓ Restored ${restored} SKILL.md files`);
         if (pluginEntries.length > 0) console.log(`✓ Removed ${pluginEntries.length} plugin entries from ${skillsPath}`);
 
-        // Remove the SessionStart session-sync hook
-        const settingsPath = resolve(homedir(), ".claude", "settings.json");
-        if (existsSync(settingsPath)) {
-          const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+        // Remove the SessionStart session-sync hook (also the legacy split-skills one)
+        const settings = readJsonFile(settingsPath, null);
+        if (settings) {
           const hooks = settings.hooks?.SessionStart ?? [];
           const filtered = hooks.filter(entry =>
             !entry.hooks?.some(h => h.command?.includes("session-sync.mjs") || h.command?.includes("split-skills.mjs"))
           );
           if (filtered.length !== hooks.length) {
             settings.hooks.SessionStart = filtered;
-            writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+            writeJsonSafe(settingsPath, settings);
             console.log(`✓ Removed session-sync SessionStart hook from ${settingsPath}`);
           }
         }

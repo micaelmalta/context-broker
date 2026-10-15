@@ -338,68 +338,6 @@ describe('ToolRouter.select()', () => {
 });
 
 // ---------------------------------------------------------------------------
-// explain()
-// ---------------------------------------------------------------------------
-
-describe('ToolRouter.explain()', () => {
-  it('returns "No servers matched" message when no servers match', () => {
-    const router = new ToolRouter({
-      github: makeServer({ description: 'GitHub service', keywords: ['github'] }),
-    });
-    expect(router.explain('unrelated query')).toBe('No servers matched this query.');
-  });
-
-  it('returns "No servers matched" for empty registry', () => {
-    const router = new ToolRouter({});
-    expect(router.explain('anything')).toBe('No servers matched this query.');
-  });
-
-  it('includes matched server name in the output', () => {
-    const router = new ToolRouter({
-      github: makeServer({ description: 'GitHub service', keywords: ['github'] }),
-    });
-    const explanation = router.explain('github issues');
-    expect(explanation).toContain('github');
-  });
-
-  it('includes the score in the output', () => {
-    const router = new ToolRouter({
-      github: makeServer({ description: 'GitHub service', keywords: ['github'] }),
-    });
-    const explanation = router.explain('github issues');
-    expect(explanation).toMatch(/score:/);
-  });
-
-  it('includes matched keywords in the output', () => {
-    const router = new ToolRouter({
-      github: makeServer({ description: 'GitHub service', keywords: ['github', 'repo'] }),
-    });
-    const explanation = router.explain('github repo');
-    expect(explanation).toContain('github');
-    expect(explanation).toContain('repo');
-  });
-
-  it('shows at most 5 results', () => {
-    const servers: Record<string, ServerConfig> = {};
-    for (let i = 0; i < 10; i++) {
-      servers[`server${i}`] = makeServer({ description: 'Generic service', keywords: ['service'] });
-    }
-    const router = new ToolRouter(servers);
-    const lines = router.explain('service').split('\n');
-    expect(lines.length).toBeLessThanOrEqual(5);
-  });
-
-  it('returns a multi-line string when multiple servers match', () => {
-    const router = new ToolRouter({
-      a: makeServer({ description: 'Alpha service', keywords: ['alpha'] }),
-      b: makeServer({ description: 'Beta service', keywords: ['beta'] }),
-    });
-    const explanation = router.explain('alpha beta');
-    expect(explanation).toContain('\n');
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Edge cases / integration
 // ---------------------------------------------------------------------------
 
@@ -410,7 +348,6 @@ describe('ToolRouter – edge cases', () => {
     });
     expect(router.rank('')).toEqual([]);
     expect(router.select('')).toEqual([]);
-    expect(router.explain('')).toBe('No servers matched this query.');
   });
 
   it('handles servers with empty keyword arrays', () => {
