@@ -1,6 +1,6 @@
 // Shared helpers for migrate.mjs, revert-migration.mjs and session-sync.mjs.
 // Plain ESM, no build step. session-sync.mjs is copied to
-// ~/.config/context-broker/scripts/ together with this file (scripts/lib/shared.mjs).
+// ~/.config/lazygate/scripts/ together with this file (scripts/lib/shared.mjs).
 
 import {
   readFileSync,
@@ -9,12 +9,63 @@ import {
   mkdirSync,
   readdirSync,
   renameSync,
+  symlinkSync,
+  lstatSync,
   copyFileSync,
   statSync,
   realpathSync,
   unlinkSync,
 } from "fs";
-import { dirname } from "path";
+import { dirname, resolve } from "path";
+import { homedir } from "os";
+
+// ─── App identity and config directory ──────────────────────────────────────
+
+export const APP_NAME = "lazygate";
+/** Previous project name — its config dir, client entries, stub markers and hook are still recognised. */
+export const LEGACY_APP_NAME = "context-broker";
+/** Every name the broker may be registered under in a client config. */
+export const BROKER_NAMES = [APP_NAME, LEGACY_APP_NAME];
+
+/**
+ * The config directory to use right now: ~/.config/lazygate, or the old
+ * ~/.config/context-broker when only that exists (e.g. --dry-run before adoption).
+ */
+export function activeConfigDir(home = homedir()) {
+  const next = resolve(home, ".config", APP_NAME);
+  const legacy = resolve(home, ".config", LEGACY_APP_NAME);
+  return !existsSync(next) && existsSync(legacy) ? legacy : next;
+}
+
+/**
+ * Move ~/.config/context-broker to ~/.config/lazygate once, leaving a symlink so hooks and
+ * scripts that still use the old path keep working. Never throws; returns true when moved.
+ */
+export function adoptLegacyConfigDir(home = homedir()) {
+  const next = resolve(home, ".config", APP_NAME);
+  const legacy = resolve(home, ".config", LEGACY_APP_NAME);
+  try {
+    if (existsSync(next)) return false;
+    const st = lstatSync(legacy, { throwIfNoEntry: false });
+    if (!st || !st.isDirectory()) return false;
+    renameSync(legacy, next);
+    try { symlinkSync(next, legacy, "dir"); } catch { /* best effort */ }
+    console.error(`[${APP_NAME}] Moved config ${legacy} → ${next}`);
+    return true;
+  } catch (err) {
+    console.error(`[${APP_NAME}] Could not move legacy config dir: ${err.message}`);
+    return false;
+  }
+}
+
+/** Remove every broker registration (current and legacy name) from a client's server map. Returns true if any was removed. */
+export function removeBrokerEntries(servers) {
+  let removed = false;
+  for (const n of BROKER_NAMES) {
+    if (servers && servers[n]) { delete servers[n]; removed = true; }
+  }
+  return removed;
+}
 
 // ─── Safe file writes ───────────────────────────────────────────────────────
 
@@ -87,7 +138,13 @@ export function findFiles(root, { name, type = "file", maxDepth = 10 }) {
 
 // ─── Frontmatter / registry entries ─────────────────────────────────────────
 
-export const STUB_MARKER = "<!-- context-broker:";
+export const STUB_MARKER = `<!-- ${APP_NAME}:`;
+/** Stubs written before the rename carry the old marker; they are still recognised. */
+export const STUB_MARKERS = [STUB_MARKER, `<!-- ${LEGACY_APP_NAME}:`];
+const findStubMarker = (text) => {
+  const hits = STUB_MARKERS.map((m) => text.indexOf(m)).filter((i) => i !== -1);
+  return hits.length ? Math.min(...hits) : -1;
+};
 
 export function parseFrontmatter(text) {
   const m = text.replace(/\r\n/g, "\n").match(/^---\n([\s\S]*?)\n---/);
@@ -133,7 +190,7 @@ export function deriveEntry(key, filePath, extra = {}, { command = false } = {})
   const firstLine = stripFrontmatter(prose)
     .split("\n")
     .map((l) => l.trim())
-    .find((l) => /^[#A-Za-z]/.test(l) && !l.startsWith(STUB_MARKER)) ?? "";
+    .find((l) => /^[#A-Za-z]/.test(l) && !STUB_MARKERS.some((m) => l.startsWith(m))) ?? "";
 
   const description =
     (fm.description || firstLine.replace(/^#+\s*/, "")).slice(0, 120) ||
@@ -169,7 +226,7 @@ export function splitSkillMd(skillPath, key) {
   if (instructionsPath === skillPath || existsSync(instructionsPath)) return false;
 
   const content = readFileSync(skillPath, "utf-8");
-  if (content.includes(STUB_MARKER)) return false; // already a stub
+  if (findStubMarker(content) !== -1) return false; // already a stub
   const match = content.match(/^(---\r?\n[\s\S]*?\r?\n---\r?\n)([\s\S]*)$/);
   if (!match) return false;
   const body = match[2].replace(/^\n+/, "");
@@ -177,7 +234,7 @@ export function splitSkillMd(skillPath, key) {
 
   const pointer =
     `${STUB_MARKER} full instructions are in INSTRUCTIONS.md next to this file; ` +
-    `load them with the context-broker load_skill tool${key ? ` ("${key}")` : ""} -->\n`;
+    `load them with the lazygate load_skill tool${key ? ` ("${key}")` : ""} -->\n`;
 
   writeFileAtomic(instructionsPath, body);
   writeFileAtomic(skillPath, match[1] + "\n" + pointer);
@@ -192,7 +249,7 @@ export function mergeInstructions(skillPath) {
 
   const stub = readFileSync(skillPath, "utf-8");
   const body = readFileSync(instructionsPath, "utf-8");
-  const idx = stub.indexOf(STUB_MARKER);
+  const idx = findStubMarker(stub);
   const head = (idx === -1 ? stub : stub.slice(0, idx)).replace(/\s+$/, "");
   writeFileAtomic(skillPath, head + "\n\n" + body);
   unlinkSync(instructionsPath);

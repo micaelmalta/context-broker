@@ -96,7 +96,7 @@ export function parseSkillsConfig(raw: unknown, source = "skills.json"): ParseRe
 const reported = new Set<string>();
 
 /** Log config errors to stderr, once per distinct message (reloads would otherwise repeat them). */
-export function reportConfigErrors(errors: string[], prefix = "[context-broker]"): void {
+export function reportConfigErrors(errors: string[], prefix = "[lazygate]"): void {
   for (const e of errors) {
     if (reported.has(e)) continue;
     reported.add(e);

@@ -5,11 +5,11 @@
 //   2. Split any un-split plugin SKILL.md files (body → INSTRUCTIONS.md) and
 //      re-sync plugin skills from ~/.claude/plugins/cache/
 //   3. Re-sync regular skills from all known skill source directories
-//      (claude, cursor, opencode, agents) and ~/.config/context-broker/skills/
+//      (claude, cursor, opencode, agents) and ~/.config/lazygate/skills/
 // Existing `migratedFrom` / `plugin` markers are preserved so `revert` keeps working.
 // Idempotent and safe to run on every session start; it never throws.
 //
-// Installed by `migrate` to ~/.config/context-broker/scripts/ together with lib/shared.mjs.
+// Installed by `migrate` to ~/.config/lazygate/scripts/ together with lib/shared.mjs.
 
 import { existsSync, readdirSync, lstatSync } from "fs";
 import { resolve, dirname, basename, relative } from "path";
@@ -21,10 +21,14 @@ import {
   deriveEntry,
   splitSkillMd,
   uniqueSkillKey,
+  adoptLegacyConfigDir,
+  activeConfigDir,
 } from "./lib/shared.mjs";
 
 const home = homedir();
-const skillsJsonPath = resolve(home, ".config", "context-broker", "skills.json");
+adoptLegacyConfigDir(home);
+const configDir = activeConfigDir(home);
+const skillsJsonPath = resolve(configDir, "skills.json");
 const pluginsCache   = resolve(home, ".claude", "plugins", "cache");
 
 // label → directory. Labels double as the `migratedFrom` marker for new entries.
@@ -33,7 +37,7 @@ const SKILL_SOURCES = [
   ["cursor",   resolve(home, ".cursor",  "skills")],
   ["opencode", resolve(home, ".config",  "opencode", "skills")],
   ["agents",   resolve(home, ".agents",  "skills")],
-  ["broker",   resolve(home, ".config",  "context-broker", "skills")],
+  ["broker",   resolve(configDir, "skills")],
 ];
 
 const KEEP_FIELDS = ["migratedFrom", "plugin"];

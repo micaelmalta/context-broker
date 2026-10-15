@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // Reverts a previous `migrate.mjs` run:
-//   - Removes entries from ~/.config/context-broker/servers.json that `migrate` created
+//   - Removes entries from ~/.config/lazygate/servers.json that `migrate` created
 //     (identified by `migratedFrom`, or the legacy "Migrated from <source>" description)
 //     and restores them to the source config in that client's own format
 //   - Re-enables exactly the plugins that `migrate` disabled
 //   - Removes skill/command entries from skills.json (identified by migratedFrom or plugin)
 //     and merges INSTRUCTIONS.md back into SKILL.md in-place
 //   - Removes the SessionStart session-sync hook from ~/.claude/settings.json
-//   - Removes the context-broker entry that migrate added to a restored client's config
+//   - Removes the lazygate (or legacy context-broker) entry that migrate added to a restored client's config
 //     (Cursor, OpenCode), and from ~/.claude.json only once no migrated servers remain
 // Every modified config file is backed up first (<file>.bak-<timestamp>).
 //
@@ -37,6 +37,10 @@ import {
   mergeInstructions,
   toCursorVars,
   mapStrings,
+  APP_NAME,
+  activeConfigDir,
+  adoptLegacyConfigDir,
+  removeBrokerEntries,
 } from "./lib/shared.mjs";
 
 // ─── CLI args ──────────────────────────────────────────────────────────────
@@ -51,6 +55,10 @@ const skillsConfigArg = get("--skills-config");
 const dryRun          = has("--dry-run");
 const explicitSkills  = has("--skills");
 const explicitPlugins = has("--plugins");
+// Pick up a config dir from before the rename (not on --dry-run, which writes nothing).
+if (!has("--dry-run")) adoptLegacyConfigDir();
+const CONFIG_DIR = activeConfigDir();
+
 const revertServers   = !explicitSkills && !explicitPlugins || has("--servers");
 const revertSkills    = explicitSkills  || (!explicitPlugins && !has("--servers"));
 const revertPlugins   = explicitPlugins || (!explicitSkills  && !has("--servers"));
@@ -112,7 +120,7 @@ function toSourceFormat(label, sourcePath, cfg) {
 if (revertServers) {
   const serversPath = configArg
     ? resolve(configArg)
-    : resolve(homedir(), ".config", "context-broker", "servers.json");
+    : resolve(CONFIG_DIR, "servers.json");
 
   let remainingCount = null; // unknown until servers.json is read
 
@@ -175,9 +183,8 @@ if (revertServers) {
             // (~/.claude.json is handled separately below).
             if (resolve(sourcePath) !== claudeJsonPath) {
               for (const key of ["mcpServers", "mcp"]) {
-                if (sourceRaw[key]?.["context-broker"]) {
-                  delete sourceRaw[key]["context-broker"];
-                  console.log(`✓ Removed context-broker from ${sourcePath}`);
+                if (removeBrokerEntries(sourceRaw[key])) {
+                  console.log(`✓ Removed ${APP_NAME} from ${sourcePath}`);
                 }
               }
             }
@@ -214,24 +221,23 @@ if (revertServers) {
     }
   }
 
-  // ─── Remove context-broker router from ~/.claude.json ───────────────────
+  // ─── Remove the broker from ~/.claude.json ───────────────────
   // Only once nothing migrated is left behind it — otherwise the remaining
   // servers would become unreachable.
   if (existsSync(claudeJsonPath)) {
     if (remainingCount !== 0) {
-      console.log(`\n  Keeping context-broker in ${claudeJsonPath} — ${remainingCount ?? "some"} server(s) still managed by the broker`);
+      console.log(`\n  Keeping ${APP_NAME} in ${claudeJsonPath} — ${remainingCount ?? "some"} server(s) still managed by the broker`);
     } else if (dryRun) {
       console.log(`\n--- ~/.claude.json broker removal (dry run) ---`);
-      console.log(`  Would remove "context-broker" from mcpServers`);
+      console.log(`  Would remove "${APP_NAME}" from mcpServers`);
       console.log("--- (not written) ---");
     } else {
       const claudeJson = readJsonFile(claudeJsonPath, {});
-      if (claudeJson.mcpServers?.["context-broker"]) {
-        delete claudeJson.mcpServers["context-broker"];
+      if (removeBrokerEntries(claudeJson.mcpServers)) {
         writeJsonSafe(claudeJsonPath, claudeJson);
-        console.log(`✓ Removed context-broker from ${claudeJsonPath}`);
+        console.log(`✓ Removed ${APP_NAME} from ${claudeJsonPath}`);
       } else {
-        console.log(`  context-broker not found in ${claudeJsonPath} — skipped`);
+        console.log(`  ${APP_NAME} not found in ${claudeJsonPath} — skipped`);
       }
     }
   }
@@ -244,7 +250,7 @@ if (revertServers) {
 if (revertSkills) {
   const skillsPath = skillsConfigArg
     ? resolve(skillsConfigArg)
-    : resolve(homedir(), ".config", "context-broker", "skills.json");
+    : resolve(CONFIG_DIR, "skills.json");
 
   if (!existsSync(skillsPath)) {
     console.log(`\n⚠  skills.json not found: ${skillsPath} — skipping skills revert.`);
@@ -301,7 +307,7 @@ if (revertSkills) {
 if (revertPlugins) {
   const skillsPath = skillsConfigArg
     ? resolve(skillsConfigArg)
-    : resolve(homedir(), ".config", "context-broker", "skills.json");
+    : resolve(CONFIG_DIR, "skills.json");
 
   const pluginsCache = resolve(homedir(), ".claude", "plugins", "cache");
 

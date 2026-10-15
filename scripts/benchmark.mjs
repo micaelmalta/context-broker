@@ -16,7 +16,7 @@
 //
 // Usage:
 //   node scripts/benchmark.mjs
-//   node scripts/benchmark.mjs --config ~/.config/context-broker/servers.json
+//   node scripts/benchmark.mjs --config ~/.config/lazygate/servers.json
 //   node scripts/benchmark.mjs --servers fetch-mcp,jira
 //   node scripts/benchmark.mjs --rounds 3
 
@@ -44,8 +44,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function resolveConfig() {
   if (configArg) return resolve(configArg);
-  const xdg = resolve(homedir(), ".config", "context-broker", "servers.json");
-  if (existsSync(xdg)) return xdg;
+  for (const dir of ["lazygate", "context-broker"]) {
+    const xdg = resolve(homedir(), ".config", dir, "servers.json");
+    if (existsSync(xdg)) return xdg;
+  }
   return resolve(__dirname, "../config/servers.json");
 }
 

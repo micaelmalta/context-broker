@@ -74,7 +74,7 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
             `No matching servers found for: "${a.query}"\n\nAvailable servers:\n` +
               (all.length
                 ? all.map((n) => `• ${n}: ${router.getConfig(n)!.description}`).join("\n")
-                : "(none configured — add entries to ~/.config/context-broker/servers.json)")
+                : "(none configured — add entries to ~/.config/lazygate/servers.json)")
           );
         }
 

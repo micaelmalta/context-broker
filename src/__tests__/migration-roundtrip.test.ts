@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import { execFileSync } from "child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, lstatSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -32,7 +32,7 @@ function run(script: string, args: string[] = []) {
   });
 }
 
-const sessionSync = () => run(p(".config", "context-broker", "scripts", "session-sync.mjs"));
+const sessionSync = () => run(p(".config", "lazygate", "scripts", "session-sync.mjs"));
 
 function buildHome() {
   writeJson(p(".claude.json"), {
@@ -76,7 +76,7 @@ describe("migrate", () => {
   });
 
   it("converts servers, labelling each with where it came from", () => {
-    const { servers } = readJson(p(".config", "context-broker", "servers.json"));
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
     expect(Object.keys(servers).sort()).toEqual(["cur", "gh", "oc", "remote", "slack"]);
     expect(servers.gh.migratedFrom).toBe("claude");
     expect(servers.cur.migratedFrom).toBe("cursor");
@@ -88,42 +88,42 @@ describe("migrate", () => {
   });
 
   it("extracts env and header secrets to the shell file, leaving ${VAR} references", () => {
-    const { servers } = readJson(p(".config", "context-broker", "servers.json"));
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
     expect(servers.gh.env.GITHUB_TOKEN).toBe("${GITHUB_TOKEN}");
     expect(servers.remote.headers.Authorization).toBe("Bearer ${REMOTE_AUTHORIZATION}");
     const rc = readFileSync(p(".zshenv"), "utf-8");
     expect(rc).toContain('export GITHUB_TOKEN="ghp_abcdefghijklmnopqrstuvwxyz0123"');
     expect(rc).toContain('export REMOTE_AUTHORIZATION="supersecretvalue123"');
-    expect(readFileSync(p(".config", "context-broker", "servers.json"), "utf-8")).not.toContain("supersecretvalue123");
+    expect(readFileSync(p(".config", "lazygate", "servers.json"), "utf-8")).not.toContain("supersecretvalue123");
   });
 
   it("normalises Cursor's ${env:VAR} syntax", () => {
-    const { servers } = readJson(p(".config", "context-broker", "servers.json"));
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
     expect(servers.cur.env.API).toBe("${SOME_VAR}");
   });
 
   it("removes migrated entries from sources, backing the originals up first", () => {
     expect(readJson(p(".claude.json")).mcpServers.gh).toBeUndefined();
     expect(readJson(p(".claude.json")).numStartups).toBe(3); // unrelated keys untouched
-    expect(Object.keys(readJson(p(".cursor", "mcp.json")).mcpServers)).toEqual(["context-broker"]);
+    expect(Object.keys(readJson(p(".cursor", "mcp.json")).mcpServers)).toEqual(["lazygate"]);
     const backups = readdirSync(home).filter((f) => f.startsWith(".claude.json.bak-"));
     expect(backups.length).toBeGreaterThan(0);
     expect(readJson(p(backups[0])).mcpServers.gh).toBeDefined();
   });
 
   it("registers the broker in Cursor and OpenCode in each client's own format", () => {
-    const cursor = readJson(p(".cursor", "mcp.json")).mcpServers["context-broker"];
+    const cursor = readJson(p(".cursor", "mcp.json")).mcpServers["lazygate"];
     expect(typeof cursor.command).toBe("string");
     expect(Array.isArray(cursor.args)).toBe(true);
 
     const oc = readJson(p(".config", "opencode", "opencode.json")).mcp;
-    expect(Object.keys(oc)).toEqual(["context-broker"]);
-    expect(oc["context-broker"].type).toBe("local");
-    expect(Array.isArray(oc["context-broker"].command)).toBe(true);
+    expect(Object.keys(oc)).toEqual(["lazygate"]);
+    expect(oc["lazygate"].type).toBe("local");
+    expect(Array.isArray(oc["lazygate"].command)).toBe(true);
   });
 
   it("records exactly which plugins it disabled", () => {
-    const { servers } = readJson(p(".config", "context-broker", "servers.json"));
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
     expect(servers.slack.disabledPlugins).toEqual(["slack@mkt"]);
     const { enabledPlugins } = readJson(p(".claude", "settings.json"));
     expect(enabledPlugins["slack@mkt"]).toBe(false);
@@ -131,7 +131,7 @@ describe("migrate", () => {
   });
 
   it("registers same-named skills from different sources under distinct keys", () => {
-    const { skills } = readJson(p(".config", "context-broker", "skills.json"));
+    const { skills } = readJson(p(".config", "lazygate", "skills.json"));
     expect(skills.foo.migratedFrom).toBe("claude");
     expect(skills["foo@cursor"].migratedFrom).toBe("cursor");
     expect(skills["foo@cursor"].path).toContain(".cursor");
@@ -146,14 +146,14 @@ describe("migrate", () => {
   });
 
   it("installs session-sync with its lib and adds the hook", () => {
-    expect(existsSync(p(".config", "context-broker", "scripts", "session-sync.mjs"))).toBe(true);
-    expect(existsSync(p(".config", "context-broker", "scripts", "lib", "shared.mjs"))).toBe(true);
+    expect(existsSync(p(".config", "lazygate", "scripts", "session-sync.mjs"))).toBe(true);
+    expect(existsSync(p(".config", "lazygate", "scripts", "lib", "shared.mjs"))).toBe(true);
     const hooks = readJson(p(".claude", "settings.json")).hooks.SessionStart;
     expect(JSON.stringify(hooks)).toContain("session-sync.mjs");
   });
 
   it("is idempotent and preserves user edits to descriptions", () => {
-    const path = p(".config", "context-broker", "servers.json");
+    const path = p(".config", "lazygate", "servers.json");
     const edited = readJson(path);
     edited.servers.gh.description = "My GitHub server";
     writeJson(path, edited);
@@ -171,7 +171,7 @@ describe("session-sync", () => {
   it("keeps migratedFrom / plugin markers so revert still works afterwards", () => {
     run(MIGRATE);
     sessionSync();
-    const { skills } = readJson(p(".config", "context-broker", "skills.json"));
+    const { skills } = readJson(p(".config", "lazygate", "skills.json"));
     expect(skills.foo.migratedFrom).toBe("claude");
     expect(skills["foo@cursor"].migratedFrom).toBe("cursor");
     expect(skills["slack:pskill"].plugin).toBe("slack");
@@ -181,13 +181,13 @@ describe("session-sync", () => {
     write(p(".claude", "skills", "nodesc", "SKILL.md"), "---\nname: nodesc\n---\n\nDoes the nodesc thing.\n");
     run(MIGRATE);
     sessionSync();
-    const { skills } = readJson(p(".config", "context-broker", "skills.json"));
+    const { skills } = readJson(p(".config", "lazygate", "skills.json"));
     expect(skills.nodesc.description).toBe("Does the nodesc thing.");
   });
 
   it("never fails the session on a corrupt registry", () => {
     run(MIGRATE);
-    writeFileSync(p(".config", "context-broker", "skills.json"), "{ not json");
+    writeFileSync(p(".config", "lazygate", "skills.json"), "{ not json");
     expect(() => sessionSync()).not.toThrow();
   });
 });
@@ -202,16 +202,16 @@ describe("revert", () => {
     const claude = readJson(p(".claude.json"));
     expect(claude.mcpServers.gh.command).toBe("npx");
     expect(claude.mcpServers.remote.url).toBe("https://remote.example/mcp");
-    expect(claude.mcpServers["context-broker"]).toBeUndefined();
+    expect(claude.mcpServers["lazygate"]).toBeUndefined();
 
     const cursor = readJson(p(".cursor", "mcp.json"));
     expect(cursor.mcpServers.cur.env.API).toBe("${env:SOME_VAR}"); // Cursor syntax restored
-    expect(cursor.mcpServers["context-broker"]).toBeUndefined(); // broker no longer needed there
+    expect(cursor.mcpServers["lazygate"]).toBeUndefined(); // broker no longer needed there
 
     const opencode = readJson(p(".config", "opencode", "opencode.json"));
     expect(opencode.mcpServers).toBeUndefined(); // not Claude's format
     expect(opencode.mcp.oc).toEqual({ type: "local", command: ["node", "y.js"], environment: { A: "1" } });
-    expect(opencode.mcp["context-broker"]).toBeUndefined();
+    expect(opencode.mcp["lazygate"]).toBeUndefined();
 
     // Plugin re-enabled; plugin server not written into any client config
     expect(readJson(p(".claude", "settings.json")).enabledPlugins["slack@mkt"]).toBe(true);
@@ -224,8 +224,8 @@ describe("revert", () => {
       .toBe("---\nname: pskill\ndescription: Plugin skill\n---\n\nPlugin body\n");
 
     // Registries empty, hook gone
-    expect(readJson(p(".config", "context-broker", "servers.json")).servers).toEqual({});
-    expect(readJson(p(".config", "context-broker", "skills.json")).skills).toEqual({});
+    expect(readJson(p(".config", "lazygate", "servers.json")).servers).toEqual({});
+    expect(readJson(p(".config", "lazygate", "skills.json")).skills).toEqual({});
     expect(JSON.stringify(readJson(p(".claude", "settings.json")).hooks?.SessionStart ?? [])).not.toContain("session-sync");
   });
 
@@ -234,18 +234,18 @@ describe("revert", () => {
     run(REVERT, ["--from", "cursor", "--servers"]);
 
     expect(readJson(p(".cursor", "mcp.json")).mcpServers.cur).toBeDefined();
-    expect(readJson(p(".cursor", "mcp.json")).mcpServers["context-broker"]).toBeUndefined();
-    expect(readJson(p(".config", "opencode", "opencode.json")).mcp["context-broker"]).toBeDefined(); // not reverted
+    expect(readJson(p(".cursor", "mcp.json")).mcpServers["lazygate"]).toBeUndefined();
+    expect(readJson(p(".config", "opencode", "opencode.json")).mcp["lazygate"]).toBeDefined(); // not reverted
     const claude = readJson(p(".claude.json"));
-    expect(claude.mcpServers["context-broker"]).toBeDefined(); // gh/remote still managed
-    const { servers } = readJson(p(".config", "context-broker", "servers.json"));
+    expect(claude.mcpServers["lazygate"]).toBeDefined(); // gh/remote still managed
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
     expect(servers.cur).toBeUndefined();
     expect(servers.gh).toBeDefined();
   });
 
   it("still finds entries by the legacy 'Migrated from' description", () => {
     run(MIGRATE);
-    const path = p(".config", "context-broker", "servers.json");
+    const path = p(".config", "lazygate", "servers.json");
     const f = readJson(path);
     f.servers.cur = { ...f.servers.cur, description: "Migrated from cursor" };
     delete f.servers.cur.migratedFrom;
@@ -253,5 +253,70 @@ describe("revert", () => {
 
     run(REVERT, ["--from", "cursor", "--servers"]);
     expect(readJson(p(".cursor", "mcp.json")).mcpServers.cur).toBeDefined();
+  });
+});
+
+describe("upgrade from the pre-rename install (context-broker)", () => {
+  const LEGACY_STUB =
+    "---\nname: old\ndescription: Old skill\n---\n\n" +
+    "<!-- context-broker: full instructions are in INSTRUCTIONS.md next to this file; load them with the context-broker load_skill tool -->\n";
+
+  beforeEach(() => {
+    writeJson(p(".config", "context-broker", "servers.json"), {
+      servers: {
+        old: { description: "kept", keywords: ["old"], command: "node", args: ["o.js"], autoActivate: false, migratedFrom: "claude" },
+      },
+    });
+    write(p(".config", "context-broker", "tool-index.json"), "{}");
+
+    const claude = readJson(p(".claude.json"));
+    claude.mcpServers["context-broker"] = { command: "node", args: ["/old/dist/index.js"] };
+    writeJson(p(".claude.json"), claude);
+
+    const settings = readJson(p(".claude", "settings.json"));
+    settings.hooks = {
+      SessionStart: [{ hooks: [{ type: "command", command: "node ~/.config/context-broker/scripts/session-sync.mjs" }] }],
+    };
+    writeJson(p(".claude", "settings.json"), settings);
+
+    write(p(".claude", "skills", "old", "SKILL.md"), LEGACY_STUB);
+    write(p(".claude", "skills", "old", "INSTRUCTIONS.md"), "# Old\nBody\n");
+  });
+
+  it("moves the config dir (leaving a symlink) and keeps existing entries", () => {
+    run(MIGRATE);
+    expect(existsSync(p(".config", "lazygate", "tool-index.json"))).toBe(true);
+    expect(lstatSync(p(".config", "context-broker")).isSymbolicLink()).toBe(true);
+    const { servers } = readJson(p(".config", "lazygate", "servers.json"));
+    expect(servers.old.description).toBe("kept");
+    expect(servers.gh).toBeDefined();
+  });
+
+  it("replaces the legacy broker entry and session hook", () => {
+    run(MIGRATE);
+    const claude = readJson(p(".claude.json"));
+    expect(claude.mcpServers.lazygate).toBeDefined();
+    expect(claude.mcpServers["context-broker"]).toBeUndefined();
+
+    const hooks = JSON.stringify(readJson(p(".claude", "settings.json")).hooks.SessionStart);
+    expect(hooks).toContain(".config/lazygate/scripts/session-sync.mjs");
+    expect(hooks).not.toContain("context-broker");
+    expect(readJson(p(".claude", "settings.json")).hooks.SessionStart).toHaveLength(1);
+  });
+
+  it("does not touch the config dir on --dry-run", () => {
+    run(MIGRATE, ["--dry-run"]);
+    expect(existsSync(p(".config", "lazygate"))).toBe(false);
+    expect(lstatSync(p(".config", "context-broker")).isDirectory()).toBe(true);
+  });
+
+  it("still merges stubs written with the old marker on revert", () => {
+    run(MIGRATE);
+    run(REVERT);
+    const restored = readFileSync(p(".claude", "skills", "old", "SKILL.md"), "utf-8");
+    expect(restored).toContain("Body");
+    expect(restored).not.toContain("context-broker");
+    expect(existsSync(p(".claude", "skills", "old", "INSTRUCTIONS.md"))).toBe(false);
+    expect(readJson(p(".claude.json")).mcpServers.lazygate).toBeUndefined();
   });
 });

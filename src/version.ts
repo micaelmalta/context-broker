@@ -15,4 +15,4 @@ function readVersion(): string {
 }
 
 export const VERSION = readVersion();
-export const LOG_PREFIX = "[context-broker]";
+export const LOG_PREFIX = "[lazygate]";

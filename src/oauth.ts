@@ -27,6 +27,7 @@ import {
   registerClient,
   type OAuthServerInfo,
 } from "@modelcontextprotocol/sdk/client/auth.js";
+import { APP_NAME, configDir } from "./paths.js";
 import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 /** Explicit overrides; all fields optional — missing values are auto-discovered. */
@@ -66,7 +67,7 @@ interface StoredClient {
   callback_port?: number;
 }
 
-const CONFIG_DIR = resolve(homedir(), ".config", "context-broker");
+const CONFIG_DIR = configDir();
 const TOKEN_DIR = resolve(CONFIG_DIR, "tokens");
 const CLIENT_DIR = resolve(CONFIG_DIR, "clients");
 
@@ -256,7 +257,7 @@ async function registerDynamicClient(
   const registered = await registerClient(info.authorizationServerUrl, {
     metadata: info.authorizationServerMetadata,
     clientMetadata: {
-      client_name: `context-broker:${serverName}`,
+      client_name: `${APP_NAME}:${serverName}`,
       redirect_uris: [redirectUri],
       grant_types: grantTypes,
       response_types: ["code"],

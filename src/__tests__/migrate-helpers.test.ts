@@ -119,10 +119,10 @@ describe("resolveBrokerEntry", () => {
     mockExecSyncFn.mockReset();
   });
 
-  it("returns global binary when context-broker is on PATH", () => {
-    mockExecSyncFn.mockReturnValue("/usr/local/bin/context-broker\n");
+  it("returns global binary when lazygate is on PATH", () => {
+    mockExecSyncFn.mockReturnValue("/usr/local/bin/lazygate\n");
     const result = resolveBrokerEntry("/some/dist");
-    expect(result).toEqual({ command: "/usr/local/bin/context-broker", args: [] });
+    expect(result).toEqual({ command: "/usr/local/bin/lazygate", args: [] });
   });
 
   it("falls back to node + dist path when binary not found", () => {
@@ -136,32 +136,32 @@ describe("resolveBrokerEntry", () => {
     mockExecSyncFn.mockImplementation(() => { throw new Error("not found"); });
     mockExistsSyncFn.mockReturnValue(false);
     const result = resolveBrokerEntry("/some/dist");
-    expect(result).toEqual({ command: "npx", args: ["-y", "context-broker"] });
+    expect(result).toEqual({ command: "npx", args: ["-y", "lazygate"] });
   });
 
   it("trims whitespace from which output", () => {
-    mockExecSyncFn.mockReturnValue("  /usr/bin/context-broker  \n");
+    mockExecSyncFn.mockReturnValue("  /usr/bin/lazygate  \n");
     const result = resolveBrokerEntry("/some/dist");
-    expect(result.command).toBe("/usr/bin/context-broker");
+    expect(result.command).toBe("/usr/bin/lazygate");
   });
 
   it("accepts global install under node_modules (legitimate path)", () => {
-    mockExecSyncFn.mockReturnValue("/usr/local/lib/node_modules/.bin/context-broker\n");
+    mockExecSyncFn.mockReturnValue("/usr/local/lib/node_modules/.bin/lazygate\n");
     const result = resolveBrokerEntry("/some/dist");
-    expect(result.command).toBe("/usr/local/lib/node_modules/.bin/context-broker");
+    expect(result.command).toBe("/usr/local/lib/node_modules/.bin/lazygate");
   });
 
   it("rejects npx shim returned by which (contains _npx)", () => {
-    mockExecSyncFn.mockReturnValue("/tmp/.npm/_npx/context-broker\n");
+    mockExecSyncFn.mockReturnValue("/tmp/.npm/_npx/lazygate\n");
     mockExistsSyncFn.mockReturnValue(false);
     const result = resolveBrokerEntry("/some/dist");
-    expect(result).toEqual({ command: "npx", args: ["-y", "context-broker"] });
+    expect(result).toEqual({ command: "npx", args: ["-y", "lazygate"] });
   });
 
   it("skips local dist when path is inside node_modules (npx run)", () => {
     mockExecSyncFn.mockImplementation(() => { throw new Error("not found"); });
     mockExistsSyncFn.mockReturnValue(true);
-    const result = resolveBrokerEntry("/tmp/.npm/_npx/abc123/node_modules/context-broker/dist");
-    expect(result).toEqual({ command: "npx", args: ["-y", "context-broker"] });
+    const result = resolveBrokerEntry("/tmp/.npm/_npx/abc123/node_modules/lazygate/dist");
+    expect(result).toEqual({ command: "npx", args: ["-y", "lazygate"] });
   });
 });

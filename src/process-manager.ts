@@ -725,7 +725,7 @@ export class ProcessManager {
       params: {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: "context-broker", version: VERSION },
+        clientInfo: { name: "lazygate", version: VERSION },
       },
     });
 
@@ -808,7 +808,7 @@ export class ProcessManager {
         params: {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "context-broker", version: VERSION },
+          clientInfo: { name: "lazygate", version: VERSION },
         },
       },
       opts.timeoutMs

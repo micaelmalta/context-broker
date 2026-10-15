@@ -1,4 +1,4 @@
-# context-broker — Project Review
+# lazygate (formerly context-broker) — Project Review
 
 Reviewed: `src/`, `scripts/`, `config/`, tests, packaging, docs, and the uncommitted working-tree changes (OAuth auto-discovery, config hot-reload, spawn-signature respawn).
 

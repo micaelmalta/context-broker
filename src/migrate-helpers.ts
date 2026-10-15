@@ -59,9 +59,9 @@ export function detectShellSecretFile(): ShellSecretFile {
 
 export function resolveBrokerEntry(distDir: string): BrokerEntry {
   try {
-    const bin = execSync("command -v context-broker 2>/dev/null", { encoding: "utf-8" }).trim();
+    const bin = execSync("command -v lazygate 2>/dev/null", { encoding: "utf-8" }).trim();
     // Reject npx temp shims only — _npx is npm's cache dir for npx runs
-    // node_modules alone is valid (e.g. /usr/local/lib/node_modules/.bin/context-broker)
+    // node_modules alone is valid (e.g. /usr/local/lib/node_modules/.bin/lazygate)
     if (bin && !bin.split(/[\\/]/).includes("_npx")) {
       return { command: bin, args: [] };
     }
@@ -73,8 +73,8 @@ export function resolveBrokerEntry(distDir: string): BrokerEntry {
   }
 
   console.warn(
-    "  ⚠  context-broker binary not found — using npx fallback. " +
-    "Run `npm install -g context-broker` for a stable install."
+    "  ⚠  lazygate binary not found — using npx fallback. " +
+    "Run `npm install -g lazygate` for a stable install."
   );
-  return { command: "npx", args: ["-y", "context-broker"] };
+  return { command: "npx", args: ["-y", "lazygate"] };
 }

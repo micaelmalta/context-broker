@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // Migrates MCP server configs from Cursor, Claude Code, OpenCode, or Agents into
-// ~/.config/context-broker/servers.json.
+// ~/.config/lazygate/servers.json.
 // Registers skills and commands in-place (no file moves) in skills.json, and
 // splits SKILL.md into frontmatter stub + INSTRUCTIONS.md where they live.
 // Detected secrets (env values and Authorization-style headers) are extracted to the
 // shell config file (~/.bashrc for bash, ~/.zshenv for zsh, ~/.config/fish/config.fish
 // for fish) and replaced with ${VAR} refs.
 //
-// The broker itself is registered as "context-broker" in ~/.claude.json and in every other
+// The broker itself is registered as "lazygate" (replacing a pre-rename "context-broker" entry) in ~/.claude.json and in every other
 // source config it migrated entries out of (Cursor, OpenCode), so those clients keep their tools.
 //
 // Every config file that is modified is backed up first (<file>.bak-<timestamp>) and
@@ -42,6 +42,11 @@ import {
   uniqueSkillKey,
   fromCursorVars,
   mapStrings,
+  APP_NAME,
+  BROKER_NAMES,
+  activeConfigDir,
+  adoptLegacyConfigDir,
+  removeBrokerEntries,
 } from "./lib/shared.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -58,6 +63,10 @@ const skillsOutArg    = get("--skills-out");
 const dryRun          = has("--dry-run");
 const explicitSkills  = has("--skills");
 const explicitPlugins = has("--plugins");
+// Pick up a config dir from before the rename (not on --dry-run, which writes nothing).
+if (!dryRun) adoptLegacyConfigDir();
+const CONFIG_DIR = activeConfigDir();
+
 // Run everything by default unless specific flags are provided
 const migrateServers = !explicitSkills && !explicitPlugins || has("--servers");
 const migrateSkills  = explicitSkills  || (!explicitPlugins && !has("--servers"));
@@ -180,7 +189,7 @@ if (migrateServers) {
   }
   const { detectShellSecretFile, resolveBrokerEntry } = await import(pathToFileURL(_helpersPath).href);
 
-  const outPath = outArg ?? resolve(homedir(), ".config", "context-broker", "servers.json");
+  const outPath = outArg ?? resolve(CONFIG_DIR, "servers.json");
   const existing = readJsonFile(outPath, { servers: {} });
   if (!existing.servers) existing.servers = {};
 
@@ -196,7 +205,7 @@ if (migrateServers) {
   const pluginDisables = new Set();
   const seenNames = new Set();
 
-  const SKIP = new Set(["router", "broker", "context-broker"]);
+  const SKIP = new Set(["router", "broker", ...BROKER_NAMES]);
 
   const claudeJsonPath = resolve(homedir(), ".claude.json");
   const brokerEntry = resolveBrokerEntry(resolve(__dirname, "..", "dist"));
@@ -204,8 +213,10 @@ if (migrateServers) {
   // Add the broker to a non-Claude client's config, in that client's own format.
   function addBroker(raw, key) {
     raw[key] ??= {};
-    if (raw[key]["context-broker"]) return false;
-    raw[key]["context-broker"] = key === "mcp"
+    const legacy = BROKER_NAMES.some((n) => n !== APP_NAME && raw[key][n]);
+    if (raw[key][APP_NAME] && !legacy) return false;
+    removeBrokerEntries(raw[key]);
+    raw[key][APP_NAME] = key === "mcp"
       ? { type: "local", command: [brokerEntry.command, ...brokerEntry.args] }
       : { ...brokerEntry };
     return true;
@@ -360,7 +371,7 @@ if (migrateServers) {
       const registered = resolve(sourcePath) !== claudeJsonPath && addBroker(raw, key);
       if (writeJsonSafe(sourcePath, raw)) {
         console.log(`✓ Removed ${names.size} entries from ${sourcePath}`);
-        if (registered) console.log(`✓ Registered context-broker in ${sourcePath}`);
+        if (registered) console.log(`✓ Registered ${APP_NAME} in ${sourcePath}`);
       }
     }
 
@@ -376,20 +387,22 @@ if (migrateServers) {
   // ─── Register context-broker router in ~/.claude.json ───────────────────
   if (dryRun) {
     for (const { sourcePath } of sourceEdits) {
-      if (resolve(sourcePath) !== claudeJsonPath) console.log(`\n  Would register context-broker in ${sourcePath}`);
+      if (resolve(sourcePath) !== claudeJsonPath) console.log(`\n  Would register ${APP_NAME} in ${sourcePath}`);
     }
     console.log("\n--- ~/.claude.json broker entry (dry run) ---");
-    console.log(JSON.stringify({ "context-broker": brokerEntry }, null, 2));
+    console.log(JSON.stringify({ [APP_NAME]: brokerEntry }, null, 2));
     console.log("--- (not written) ---");
   } else {
     const claudeJson = readJsonFile(claudeJsonPath, {});
     if (!claudeJson.mcpServers) claudeJson.mcpServers = {};
-    if (!claudeJson.mcpServers["context-broker"]) {
-      claudeJson.mcpServers["context-broker"] = brokerEntry;
+    const hadLegacy = BROKER_NAMES.some((n) => n !== APP_NAME && claudeJson.mcpServers[n]);
+    if (!claudeJson.mcpServers[APP_NAME] || hadLegacy) {
+      removeBrokerEntries(claudeJson.mcpServers);
+      claudeJson.mcpServers[APP_NAME] = brokerEntry;
       writeJsonSafe(claudeJsonPath, claudeJson);
-      console.log(`✓ Registered context-broker in ${claudeJsonPath}`);
+      console.log(`✓ Registered ${APP_NAME} in ${claudeJsonPath}${hadLegacy ? " (replaced legacy context-broker entry)" : ""}`);
     } else {
-      console.log(`  context-broker already registered in ${claudeJsonPath} — skipped`);
+      console.log(`  ${APP_NAME} already registered in ${claudeJsonPath} — skipped`);
     }
   }
 }
@@ -400,7 +413,7 @@ if (migrateServers) {
 // in-place.
 
 if (migrateSkills) {
-  const skillsOutPath = skillsOutArg ?? resolve(homedir(), ".config", "context-broker", "skills.json");
+  const skillsOutPath = skillsOutArg ?? resolve(CONFIG_DIR, "skills.json");
 
   const existingSkills = readJsonFile(skillsOutPath, { skills: {} });
   if (!existingSkills.skills) existingSkills.skills = {};
@@ -511,7 +524,7 @@ if (migrateSkills) {
 
 if (migratePlugins) {
   const pluginsCache = resolve(homedir(), ".claude", "plugins", "cache");
-  const skillsOutPath = skillsOutArg ?? resolve(homedir(), ".config", "context-broker", "skills.json");
+  const skillsOutPath = skillsOutArg ?? resolve(CONFIG_DIR, "skills.json");
 
   if (!existsSync(pluginsCache)) {
     console.log(`\n⚠  Plugins cache not found: ${pluginsCache} — skipping plugins migration.`);
@@ -574,8 +587,8 @@ if (migratePlugins) {
       if (splitCount > 0) console.log(`✓ Split:   ${splitCount} SKILL.md file(s)`);
       console.log(`✓ Written: ${skillsOutPath}`);
 
-      // Install session-sync.mjs (+ its lib/) into ~/.config/context-broker/scripts/
-      const scriptsDstDir = resolve(homedir(), ".config", "context-broker", "scripts");
+      // Install session-sync.mjs (+ its lib/) into ~/.config/lazygate/scripts/
+      const scriptsDstDir = resolve(CONFIG_DIR, "scripts");
       mkdirSync(resolve(scriptsDstDir, "lib"), { recursive: true });
       copyFileSync(resolve(__dirname, "session-sync.mjs"), resolve(scriptsDstDir, "session-sync.mjs"));
       copyFileSync(resolve(__dirname, "lib", "shared.mjs"), resolve(scriptsDstDir, "lib", "shared.mjs"));
@@ -586,12 +599,21 @@ if (migratePlugins) {
       const settings = readJsonFile(settingsPath, {});
       if (!settings.hooks) settings.hooks = {};
       if (!settings.hooks.SessionStart) settings.hooks.SessionStart = [];
-      const hookCmd = "node ~/.config/context-broker/scripts/session-sync.mjs";
+      const hookCmd = `node ~/.config/${APP_NAME}/scripts/session-sync.mjs`;
+      // Drop a hook that points at the pre-rename directory; it is re-added below.
+      const isLegacyHook = (h) => h.command?.includes("context-broker/scripts/session-sync.mjs");
+      const before = settings.hooks.SessionStart.length;
+      settings.hooks.SessionStart = settings.hooks.SessionStart.filter(
+        (entry) => !entry.hooks?.some(isLegacyHook)
+      );
+      const replacedLegacy = settings.hooks.SessionStart.length !== before;
       const alreadyPresent = settings.hooks.SessionStart.some(entry =>
         entry.hooks?.some(h => h.command === hookCmd)
       );
-      if (!alreadyPresent) {
-        settings.hooks.SessionStart.push({ hooks: [{ type: "command", command: hookCmd }] });
+      if (!alreadyPresent || replacedLegacy) {
+        if (!alreadyPresent) {
+          settings.hooks.SessionStart.push({ hooks: [{ type: "command", command: hookCmd }] });
+        }
         writeJsonSafe(settingsPath, settings);
         console.log(`✓ Added SessionStart hook → ${settingsPath}`);
       } else {

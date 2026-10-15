@@ -39,7 +39,7 @@ const { getAccessToken, openBrowser } = await import("../oauth.js");
 if (!home.startsWith(tmpdir())) throw new Error("test home not isolated");
 
 const SERVER_URL = "https://mcp.example.com/mcp";
-const tokenDir = join(home, ".config", "context-broker", "tokens");
+const tokenDir = join(home, ".config", "lazygate", "tokens");
 const tokenFile = (n: string) => join(tokenDir, `${n}.json`);
 
 let as: Server;
@@ -239,7 +239,7 @@ describe("getAccessToken", () => {
     await getAccessToken("srv", SERVER_URL);
     expect(mockRegister).toHaveBeenCalledTimes(1);
 
-    const client = JSON.parse(readFileSync(join(home, ".config", "context-broker", "clients", "srv.json"), "utf-8"));
+    const client = JSON.parse(readFileSync(join(home, ".config", "lazygate", "clients", "srv.json"), "utf-8"));
     expect(client.callback_port).toBeGreaterThan(0);
     expect(client.resource).toBe(SERVER_URL);
 
@@ -256,7 +256,7 @@ describe("getAccessToken", () => {
       return [{ url: ok, expectStatus: 200 }];
     });
     await getAccessToken("../../escape", SERVER_URL, { clientId: "pre" });
-    expect(existsSync(join(home, ".config", "context-broker", "tokens", ".._.._escape.json"))).toBe(true);
+    expect(existsSync(join(home, ".config", "lazygate", "tokens", ".._.._escape.json"))).toBe(true);
     expect(existsSync(join(home, "escape.json"))).toBe(false);
   });
 });

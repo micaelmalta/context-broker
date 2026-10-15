@@ -17,11 +17,11 @@ npm run revert-migration  # node dist/index.js revert
 Tests live in `src/__tests__/`. The migration tests run the real `scripts/*.mjs` as child
 processes against a temporary `HOME`, so they need `dist/` (the `pretest` build provides it).
 Tests that touch OAuth mock `os.homedir()` — never let a test write to the real
-`~/.config/context-broker`.
+`~/.config/lazygate`.
 
 ## Architecture
 
-context-broker is an MCP server that itself acts as a proxy. It exposes **6 meta-tools** to Claude Code instead of loading all real MCP server schemas upfront. Real servers and skills are loaded on demand.
+lazygate (formerly context-broker) is an MCP server that itself acts as a proxy. It exposes **6 meta-tools** to Claude Code instead of loading all real MCP server schemas upfront. Real servers and skills are loaded on demand.
 
 ### Source files (`src/`)
 
@@ -39,7 +39,8 @@ context-broker is an MCP server that itself acts as a proxy. It exposes **6 meta
 | `process-manager.ts` | `ProcessManager` — stdio children and HTTP servers: handshake, tool-call proxying, per-server timeouts, activation dedup, collision detection, `onToolsChanged` callback |
 | `oauth.ts` | PKCE OAuth for HTTP servers: discovery, DCR, loopback callback (state-checked), token storage (`0600`), forced refresh, in-flight dedup |
 | `migrate-helpers.ts` | Shell detection / secret-file formatting and broker path resolution used by `migrate.mjs` |
-| `version.ts` | `VERSION` (from package.json) and the `[context-broker]` log prefix |
+| `version.ts` | `VERSION` (from package.json) and the `[lazygate]` log prefix |
+| `paths.ts` | `APP_NAME`, `configDir()`, and `adoptLegacyConfigDir()` — one-time move of `~/.config/context-broker` to `~/.config/lazygate` (old path left as a symlink) |
 
 ### Request flow
 
@@ -52,11 +53,11 @@ context-broker is an MCP server that itself acts as a proxy. It exposes **6 meta
 
 ### Config files
 
-- `~/.config/context-broker/servers.json` — server registry (`{ servers: { name: { description, keywords, command, args, env, inheritEnv, autoActivate, toolTimeoutMs, migratedFrom, disabledPlugins } } }`; HTTP servers use `type`, `url`, `headers`, `oauth`)
-- `~/.config/context-broker/skills.json` — skill registry (`{ skills: { name: { description, keywords, path, migratedFrom | plugin } } }`)
+- `~/.config/lazygate/servers.json` — server registry (`{ servers: { name: { description, keywords, command, args, env, inheritEnv, autoActivate, toolTimeoutMs, migratedFrom, disabledPlugins } } }`; HTTP servers use `type`, `url`, `headers`, `oauth`)
+- `~/.config/lazygate/skills.json` — skill registry (`{ skills: { name: { description, keywords, path, migratedFrom | plugin } } }`)
 - `config/*.json` in the repo — **examples only**, never loaded implicitly
 
-Config resolution: `--config` / `--skills` flag → `~/.config/context-broker/<file>`; otherwise an empty registry.
+Config resolution: `--config` / `--skills` flag → `~/.config/lazygate/<file>`; otherwise an empty registry.
 
 ### Scripts (`scripts/`)
 
@@ -68,10 +69,19 @@ Plain `.mjs` files, no build step (except `migrate.mjs`, which imports `dist/mig
 - `session-sync.mjs` — SessionStart hook; prunes stale entries, re-splits plugin skills, re-syncs skills while **preserving `migratedFrom`/`plugin`** markers. Never throws.
 - `benchmark.mjs` — runs `claude -p` with four strategies (no MCP, all servers direct, broker idle, broker + all activated); single cold-cache turn, so cost figures overstate steady-state savings.
 
+### Rename (context-broker → lazygate)
+
+The package, bin, log prefix, config directory and client entry were renamed. Legacy names are still
+recognised so existing installs upgrade in place: the config directory is adopted on first run
+(broker, `migrate`, `revert`, `session-sync`), `migrate` replaces a `context-broker` client entry and
+`SessionStart` hook with the new ones, `revert` removes either name, and stubs carrying the old
+`<!-- context-broker: -->` marker are still merged back. Keep these paths working when touching
+`scripts/lib/shared.mjs` (`BROKER_NAMES`, `STUB_MARKERS`, `adoptLegacyConfigDir`).
+
 ### Plugin skill split
 
 Each `SKILL.md` is split into:
-- `SKILL.md` — frontmatter plus a one-line `<!-- context-broker: … -->` pointer (what the harness injects per session)
+- `SKILL.md` — frontmatter plus a one-line `<!-- lazygate: … -->` pointer (what the harness injects per session)
 - `INSTRUCTIONS.md` — body only (loaded on demand via `load_skill`)
 
 The `SessionStart` hook re-runs the split after plugin updates. On revert, `INSTRUCTIONS.md` is merged back (the pointer line is dropped), reproducing the original file.

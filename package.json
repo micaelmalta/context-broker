@@ -1,11 +1,11 @@
 {
-    "name": "context-broker",
+    "name": "lazygate",
     "version": "1.0.0",
     "description": "Lazy-loading MCP broker for Claude Code",
     "type": "module",
     "main": "dist/index.js",
     "bin": {
-        "context-broker": "./dist/index.js"
+        "lazygate": "./dist/index.js"
     },
     "files": [
         "dist",
@@ -14,11 +14,11 @@
     ],
     "repository": {
         "type": "git",
-        "url": "https://github.com/micaelmalta/context-broker.git"
+        "url": "https://github.com/micaelmalta/lazygate.git"
     },
-    "homepage": "https://github.com/micaelmalta/context-broker",
+    "homepage": "https://github.com/micaelmalta/lazygate",
     "bugs": {
-        "url": "https://github.com/micaelmalta/context-broker/issues"
+        "url": "https://github.com/micaelmalta/lazygate/issues"
     },
     "scripts": {
         "build": "tsc",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // src/index.ts
-// MCP Broker - exposes meta-tools to Claude Code,
+// lazygate - exposes meta-tools to Claude Code,
 // lazily activates real MCP servers on demand
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -21,6 +21,7 @@ import { parseServersConfig, parseSkillsConfig, reportConfigErrors } from "./con
 import { createBroker } from "./broker.js";
 import { META_TOOL_NAMES } from "./meta-tools.js";
 import { ToolIndex } from "./tool-index.js";
+import { adoptLegacyConfigDir, configDir, APP_NAME } from "./paths.js";
 import { VERSION, LOG_PREFIX } from "./version.js";
 
 // ─── Subcommand dispatch ────────────────────────────────────────────────────
@@ -46,8 +47,11 @@ if (subcommand && SUBCOMMANDS[subcommand]) {
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+// Pick up a config directory from before the rename (context-broker → lazygate).
+adoptLegacyConfigDir();
+
 /**
- * Resolution: --<flag> <path> → ~/.config/context-broker/<file>.
+ * Resolution: --<flag> <path> → ~/.config/lazygate/<file>.
  * The bundled config/ directory only holds *examples* and is never loaded
  * implicitly (its paths don't exist on real machines).
  */
@@ -59,7 +63,7 @@ function resolveConfigPath(flag: string, file: string): string | null {
     return p;
   }
 
-  const xdg = resolve(homedir(), ".config", "context-broker", file);
+  const xdg = resolve(configDir(), file);
   return existsSync(xdg) ? xdg : null;
 }
 
@@ -80,13 +84,13 @@ if (configPath) {
   console.error(`${LOG_PREFIX} Config: ${configPath} (${Object.keys(entries).length} servers)`);
 } else {
   console.error(
-    `${LOG_PREFIX} No servers.json found. Create ~/.config/context-broker/servers.json ` +
+    `${LOG_PREFIX} No servers.json found. Create ~/.config/lazygate/servers.json ` +
       `(see config/servers.json in the repo for an example) or pass --config <path>. ` +
       `Starting with an empty registry.`
   );
 }
 
-const toolIndex = new ToolIndex(resolve(homedir(), ".config", "context-broker", "tool-index.json"));
+const toolIndex = new ToolIndex(resolve(configDir(), "tool-index.json"));
 const router = new ToolRouter(serverConfigs, configPath ?? undefined, toolIndex);
 
 // ─── Skills ────────────────────────────────────────────────────────────────
@@ -109,7 +113,7 @@ if (skillsConfigPath) {
 // ─── MCP Server ────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "context-broker", version: VERSION },
+  { name: APP_NAME, version: VERSION },
   { capabilities: { tools: { listChanged: true } } }
 );
 
