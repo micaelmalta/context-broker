@@ -124,6 +124,21 @@ describe("createBroker", () => {
       expect(text(r).length).toBeLessThan(400);
     });
 
+    it("lists names only for servers with many tools", async () => {
+      const many = Array.from({ length: 31 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: "Does a thing. With lots of detail that should not be repeated.",
+        inputSchema: {},
+        serverName: "github",
+      }));
+      mk.manager.activate.mockResolvedValueOnce(many);
+      const r = await broker.callTool("activate_server", { server_name: "github" });
+      expect(text(r)).toMatch(/with 31 tools \(names only/);
+      expect(text(r)).toContain("tool_0, tool_1");
+      expect(text(r)).not.toContain("Does a thing");
+      expect(text(r).length).toBeLessThan(500);
+    });
+
     it("flags unknown servers as errors", async () => {
       const r = await broker.callTool("activate_server", { server_name: "nope" });
       expect(r.isError).toBe(true);

@@ -42,6 +42,22 @@ function matchedLine(keywords: string[], descriptionWords: string[], toolWords: 
 }
 
 const SUMMARY_MAX = 160;
+/** Above this many tools, activation lists names only (the schemas carry the details). */
+const DETAILED_LIST_MAX_TOOLS = 12;
+
+export function formatActivation(serverName: string, tools: Array<{ name: string; description?: string }>): string {
+  if (tools.length > DETAILED_LIST_MAX_TOOLS) {
+    return (
+      `✓ Activated "${serverName}" with ${tools.length} tools (names only; descriptions are in the tool schemas):\n` +
+      tools.map((t) => t.name).join(", ")
+    );
+  }
+  return (
+    `✓ Activated "${serverName}" with ${tools.length} tools (first sentence of each; ` +
+    `full descriptions are in the tool schemas):\n` +
+    tools.map((t) => `  • ${t.name}: ${summarizeDescription(t.description)}`).join("\n")
+  );
+}
 
 /**
  * First sentence of a tool description, capped in length. Activation output uses this so a
@@ -122,11 +138,7 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
         }
         try {
           const tools = await manager.activate(a.server_name, cfg);
-          return text(
-            `✓ Activated "${a.server_name}" with ${tools.length} tools (first sentence of each; ` +
-              `full descriptions are in the tool schemas):\n` +
-              tools.map((t) => `  • ${t.name}: ${summarizeDescription(t.description)}`).join("\n")
-          );
+          return text(formatActivation(a.server_name, tools));
         } catch (err) {
           return fail(`Failed to activate "${a.server_name}": ${(err as Error).message}`);
         }
