@@ -2,9 +2,9 @@
 // Request handling for the broker, independent of the stdio transport so it can be tested.
 
 import type { z } from "zod";
-import type { ToolRouter } from "./router.js";
+import type { ToolRouter, ServerConfig } from "./router.js";
 import type { SkillRouter } from "./skill-router.js";
-import type { ProcessManager } from "./process-manager.js";
+import type { ProcessManager, RuntimeCredentials } from "./process-manager.js";
 import {
   META_TOOLS,
   QuerySchema,
@@ -19,10 +19,24 @@ export interface ToolResult {
   [key: string]: unknown;
 }
 
+/** Per-caller access rules (gateway mode). Without it every configured server is usable. */
+export interface BrokerAccess {
+  /** Whether this caller may see and use the server. */
+  canUse(name: string, cfg: ServerConfig): boolean;
+  /**
+   * Resolve the caller's credentials for the server. Throws an Error with a user-facing message
+   * (e.g. which header to send) when something required is missing.
+   */
+  prepare(name: string, cfg: ServerConfig): RuntimeCredentials | undefined;
+  /** What the caller still has to provide before the server can be activated (shown by discover_tools). */
+  missing?(name: string, cfg: ServerConfig): string[];
+}
+
 export interface BrokerDeps {
   router: ToolRouter;
   manager: ProcessManager;
   skillRouter: SkillRouter | null;
+  access?: BrokerAccess;
 }
 
 function text(t: string): ToolResult {
@@ -77,7 +91,14 @@ export function summarizeDescription(description: string | undefined, max = SUMM
   return sentence.length > max ? sentence.slice(0, max - 1).trimEnd() + "…" : sentence;
 }
 
-export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
+export function createBroker({ router, manager, skillRouter, access }: BrokerDeps) {
+  /** Servers this caller may see. Hidden servers behave exactly like unknown ones. */
+  const visible = (name: string): boolean => {
+    const cfg = router.getConfig(name);
+    return Boolean(cfg) && (!access || access.canUse(name, cfg!));
+  };
+  const visibleNames = (): string[] => router.listAll().filter(visible);
+
   function listTools() {
     const activeTools = manager.getAllActiveTools().map((t) => ({
       name: t.name,
@@ -102,10 +123,10 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
         const a = parseArgs(QuerySchema, rawArgs);
         if (isResult(a)) return a;
         router.reloadServersFromDisk();
-        const ranked = router.rank(a.query);
+        const ranked = router.rank(a.query).filter((r) => visible(r.name));
 
         if (ranked.length === 0) {
-          const all = router.listAll();
+          const all = visibleNames();
           return text(
             `No matching servers found for: "${a.query}"\n\nAvailable servers:\n` +
               (all.length
@@ -117,8 +138,10 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
         const active = manager.listActive();
         const lines = ranked.map((r) => {
           const cfg = router.getConfig(r.name)!;
-          const status = active.includes(r.name) ? "✓ active" : "○ inactive";
-          return `${status} | ${r.name} (score: ${r.score})\n  ${cfg.description}\n  Matched ${matchedLine(r.reason, r.descriptionMatches, r.toolMatches)}`;
+          const missing = active.includes(r.name) ? [] : access?.missing?.(r.name, cfg) ?? [];
+          const status = active.includes(r.name) ? "✓ active" : missing.length ? "⚠ needs credentials" : "○ inactive";
+          const needs = missing.length ? `\n  Needs: ${missing.join(", ")}` : "";
+          return `${status} | ${r.name} (score: ${r.score})\n  ${cfg.description}\n  Matched ${matchedLine(r.reason, r.descriptionMatches, r.toolMatches)}${needs}`;
         });
         return text(
           `Servers relevant to "${a.query}":\n\n${lines.join("\n\n")}\n\n` +
@@ -131,13 +154,13 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
         if (isResult(a)) return a;
         router.reloadServersFromDisk();
         const cfg = router.getConfig(a.server_name);
-        if (!cfg) {
+        if (!cfg || !visible(a.server_name)) {
           return fail(
-            `Unknown server: "${a.server_name}". Available: ${router.listAll().join(", ") || "(none)"}`
+            `Unknown server: "${a.server_name}". Available: ${visibleNames().join(", ") || "(none)"}`
           );
         }
         try {
-          const tools = await manager.activate(a.server_name, cfg);
+          const tools = await manager.activate(a.server_name, cfg, access?.prepare(a.server_name, cfg));
           return text(formatActivation(a.server_name, tools));
         } catch (err) {
           return fail(`Failed to activate "${a.server_name}": ${(err as Error).message}`);
@@ -219,11 +242,11 @@ export function createBroker({ router, manager, skillRouter }: BrokerDeps) {
     if (!serverName) {
       // Best-effort auto-activation based on the tool name.
       router.reloadServersFromDisk();
-      const candidate = router.select(name, 1)[0];
+      const candidate = router.select(name, 10).find(visible);
       const cfg = candidate ? router.getConfig(candidate) : undefined;
       if (candidate && cfg) {
         try {
-          await manager.activate(candidate, cfg);
+          await manager.activate(candidate, cfg, access?.prepare(candidate, cfg));
           serverName = manager.findServerForTool(name);
         } catch (err) {
           console.error(`${LOG_PREFIX} auto-activation of "${candidate}" failed: ${(err as Error).message}`);

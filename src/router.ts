@@ -10,6 +10,24 @@ import { LOG_PREFIX } from "./version.js";
 
 export type { OAuthConfig };
 
+/**
+ * Where a server's credentials come from (gateway mode; ignored by plain stdio mode unless
+ * `${secret:…}` / `${cred:…}` templates are used).
+ * - scope "server" (default): one credential for everyone — `${secret:path}` from the gateway's
+ *   secret store.
+ * - scope "user": each user's own — `${cred:field}` from the `X-Lazygate-Cred-<Server>-<Field>`
+ *   request headers, and per-user OAuth tokens for HTTP servers.
+ * - fallback "server": when the user sent nothing, `${cred:field}` falls back to the secret
+ *   `<server>/<field>`.
+ * `env` (stdio) and `headers` (HTTP) are templates applied on top of the server's own.
+ */
+export interface AuthConfig {
+  scope?: "user" | "server";
+  fallback?: "server";
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
 export interface ServerConfig {
   description: string;
   keywords: string[];
@@ -38,6 +56,10 @@ export interface ServerConfig {
    * The server's own `env` entries are always added on top.
    */
   inheritEnv?: boolean | string[];
+  /** Credential sources (see AuthConfig). */
+  auth?: AuthConfig;
+  /** Gateway mode: only users in one of these groups can see or use the server (omit = everyone). */
+  groups?: string[];
   /** Per-call timeout for tools/call (default 5 minutes). */
   toolTimeoutMs?: number;
   /** Set by `migrate` so `revert` can find the entries it created. */

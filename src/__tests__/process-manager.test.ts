@@ -239,6 +239,31 @@ describe("ProcessManager", () => {
       expect(mockSpawnFn).toHaveBeenCalledTimes(2);
     });
 
+    it("merges gateway credentials into the env without re-expanding them", async () => {
+      process.env.CB_GATEWAY_ONLY = "gateway-private";
+      setupFakeProcess([]);
+      await manager.activate(
+        "srv",
+        makeStdioConfig({ env: { OWN: "1" }, inheritEnv: false }),
+        { env: { TOKEN: "${CB_GATEWAY_ONLY}", OWN: "overridden" } }
+      );
+      const env = (mockSpawnFn.mock.calls[0] as [string, string[], { env: Record<string, string> }])[2].env;
+      expect(env.TOKEN).toBe("${CB_GATEWAY_ONLY}"); // literal — not expanded from the gateway's environment
+      expect(env.OWN).toBe("overridden");
+      delete process.env.CB_GATEWAY_ONLY;
+    });
+
+    it("respawns when a gateway credential changes, but not when it is unchanged", async () => {
+      setupFakeProcess([]);
+      await manager.activate("srv", makeStdioConfig(), { env: { TOKEN: "one" } });
+      await manager.activate("srv", makeStdioConfig(), { env: { TOKEN: "one" } });
+      expect(mockSpawnFn).toHaveBeenCalledTimes(1);
+
+      setupFakeProcess([]);
+      await manager.activate("srv", makeStdioConfig(), { env: { TOKEN: "two" } });
+      expect(mockSpawnFn).toHaveBeenCalledTimes(2);
+    });
+
     it("reports each server's tools through onServerTools", async () => {
       const seen: Array<[string, string[]]> = [];
       const mgr = new ProcessManager({ onServerTools: (n, t) => seen.push([n, t.map((x) => x.name)]) });
@@ -554,6 +579,43 @@ describe("ProcessManager", () => {
       );
       const retryHeaders = (fetchMock.mock.calls[1]?.[1] as RequestInit | undefined)?.headers as Record<string, string>;
       expect(retryHeaders.Authorization).toBe("Bearer test-token");
+    });
+
+    it("sends gateway credentials as headers and reopens the session when they change", async () => {
+      mockHttpFlow([{ name: "t", description: "T", inputSchema: {} }]);
+      await manager.activate("h", makeHttpConfig(), { headers: { "X-Api-Key": "key-one" } });
+      const first = (fetchMock.mock.calls[0]?.[1] as RequestInit).headers as Record<string, string>;
+      expect(first["X-Api-Key"]).toBe("key-one");
+
+      // same credential → no new handshake
+      const calls = fetchMock.mock.calls.length;
+      await manager.activate("h", makeHttpConfig(), { headers: { "X-Api-Key": "key-one" } });
+      expect(fetchMock.mock.calls.length).toBe(calls);
+
+      // changed credential → fresh session
+      mockHttpFlow([{ name: "t", description: "T", inputSchema: {} }]);
+      await manager.activate("h", makeHttpConfig(), { headers: { "X-Api-Key": "key-two" } });
+      const reopened = fetchMock.mock.calls.slice(calls).map((c) => (c[1] as RequestInit).headers as Record<string, string>);
+      expect(reopened.some((h) => h["X-Api-Key"] === "key-two")).toBe(true);
+    });
+
+    it("stores OAuth tokens per user only for user-scope servers", async () => {
+      const gw = new ProcessManager({ owner: "alice" });
+      // user scope: first request 401 → OAuth with owner
+      fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+      mockHttpFlow([{ name: "a", description: "A", inputSchema: {} }]);
+      await gw.activate("per-user", makeHttpConfig("https://mcp.example.com/mcp", { auth: { scope: "user" } }));
+      expect(mockGetAccessTokenFn).toHaveBeenLastCalledWith(
+        "per-user", "https://mcp.example.com/mcp", {}, { force: true, owner: "alice" }
+      );
+
+      // server scope (default): shared token, no owner
+      fetchMock.mockResolvedValueOnce(jsonResponse({}, 401));
+      mockHttpFlow([{ name: "b", description: "B", inputSchema: {} }]);
+      await gw.activate("shared", makeHttpConfig("https://mcp2.example.com/mcp"));
+      expect(mockGetAccessTokenFn).toHaveBeenLastCalledWith(
+        "shared", "https://mcp2.example.com/mcp", {}, { force: true, owner: undefined }
+      );
     });
 
     it("does not start OAuth when the server is open", async () => {

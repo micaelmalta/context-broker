@@ -40,6 +40,13 @@ lazygate (formerly context-broker) is an MCP server that itself acts as a proxy.
 | `oauth.ts` | PKCE OAuth for HTTP servers: discovery, DCR, loopback callback (state-checked), token storage (`0600`), forced refresh, in-flight dedup |
 | `migrate-helpers.ts` | Shell detection / secret-file formatting and broker path resolution used by `migrate.mjs` |
 | `version.ts` | `VERSION` (from package.json) and the `[lazygate]` log prefix |
+| `registry.ts` | `loadRegistry(argv)` — loads `servers.json` / `skills.json`, builds `ToolRouter` / `SkillRouter` / `ToolIndex` (used by stdio mode and the gateway) |
+| `gateway/server.ts` | HTTP gateway: Streamable HTTP, one `Session` (own `ProcessManager`, credentials, redactor) per MCP session, bearer-token auth, Host/Origin checks, idle sweep, audit |
+| `gateway/credentials.ts` | `X-Lazygate-Cred-*` header parsing, `SecretStore`, `CredentialResolver` (`${cred:…}` / `${secret:…}` templates), group policy |
+| `gateway/tokens.ts` | `TokenStore` — personal access tokens (`lzg_<id>_<secret>`, hash only) |
+| `gateway/vault.ts` | `UserVault` — per-user credentials saved from the web UI, AES-256-GCM bound to user/server/field; `mergeCreds` (request headers win) |
+| `gateway/ui-api.ts`, `gateway/ui-assets.ts` | Web UI at `/ui`: JSON API (token-gated, admin split) and the embedded page/script/CSS (no inline script or style — strict CSP) |
+| `gateway/{cli,audit,redact,private-file,http-util}.ts` | `serve` / `token` / `secret` commands, JSONL audit log, secret redaction, 0600 file helpers |
 | `paths.ts` | `APP_NAME`, `configDir()`, and `adoptLegacyConfigDir()` — one-time move of `~/.config/context-broker` to `~/.config/lazygate` (old path left as a symlink) |
 
 ### Request flow

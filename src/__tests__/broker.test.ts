@@ -190,7 +190,7 @@ describe("createBroker", () => {
       // 'github_tool' tokenises to github + tool → matches the github server
       const r = await broker.callTool("github_tool", {});
       expect(text(r)).toBe("called");
-      expect(mk.manager.activate).toHaveBeenCalledWith("github", expect.anything());
+      expect(mk.manager.activate).toHaveBeenCalledWith("github", expect.anything(), undefined);
     });
 
     it("turns auto-activation failures into tool errors instead of throwing", async () => {
