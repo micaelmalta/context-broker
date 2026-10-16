@@ -153,6 +153,7 @@ npx -y lazygate token create --user alice --groups eng   # shown once
 npx -y lazygate serve                                    # http://127.0.0.1:8787/mcp
 ```
 
+A web UI at `/ui` manages your own keys, and (with an admin token) tokens, secrets and servers.
 See [docs/gateway.md](docs/gateway.md).
 
 ---

@@ -187,7 +187,7 @@ describe("TokenStore", () => {
     const store = new TokenStore(d);
     const { id, token } = store.create({ user: "alice", groups: ["eng"] });
     expect(token).toMatch(/^lzg_[0-9a-f]{8}_/);
-    expect(store.verify(token)).toEqual({ id: "alice", groups: ["eng"], tokenId: id });
+    expect(store.verify(token)).toEqual({ id: "alice", groups: ["eng"], tokenId: id, admin: false });
     const secret = token.split("_").slice(2).join("_");
     expect(readFileSync(store.path, "utf-8")).not.toContain(secret);
     if (process.platform !== "win32") expect(statSync(store.path).mode & 0o777).toBe(0o600);

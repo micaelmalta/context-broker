@@ -6,6 +6,7 @@ import { configDir } from "../paths.js";
 import { loadRegistry } from "../registry.js";
 import { LOG_PREFIX } from "../version.js";
 import { SecretStore, secretEnvName } from "./credentials.js";
+import { UserVault } from "./vault.js";
 import { TokenStore, parseDuration } from "./tokens.js";
 import { AuditLog } from "./audit.js";
 import { startGateway } from "./server.js";
@@ -60,6 +61,7 @@ async function serve(args: string[]): Promise<void> {
     registry,
     tokens,
     secrets: new SecretStore(dir),
+    vault: new UserVault(dir),
     audit: new AuditLog(resolve(dir, "audit.log")),
     host,
     port,
@@ -85,16 +87,18 @@ async function tokenCmd(args: string[]): Promise<void> {
 
   if (action === "create") {
     const user = flag(rest, "--user");
-    if (!user) throw new Error("usage: lazygate token create --user <name> [--groups a,b] [--expires 90d] [--label text]");
+    if (!user) throw new Error("usage: lazygate token create --user <name> [--groups a,b] [--expires 90d] [--label text] [--admin]");
     const expires = flag(rest, "--expires");
     const { id, token } = store.create({
       user,
       groups: (flag(rest, "--groups") ?? "").split(",").filter(Boolean),
       expiresInMs: expires ? parseDuration(expires) : undefined,
       label: flag(rest, "--label"),
+      admin: has(rest, "--admin"),
     });
     console.log(`Token ${id} for ${user} (shown once — store it somewhere safe):\n\n  ${token}\n`);
     console.log(`Use it as:  Authorization: Bearer ${token}`);
+    console.log(`Web UI:     open /ui on the gateway and paste the token${has(rest, "--admin") ? "" : " (add --admin to manage tokens/secrets/servers)"}`);
     return;
   }
 
@@ -103,7 +107,7 @@ async function tokenCmd(args: string[]): Promise<void> {
     if (!rows.length) return void console.log("No tokens.");
     for (const t of rows) {
       console.log(
-        `${t.id}  ${t.user}  groups=[${t.groups.join(",")}]  created=${t.createdAt}` +
+        `${t.id}  ${t.user}${t.admin ? " (admin)" : ""}  groups=[${t.groups.join(",")}]  created=${t.createdAt}` +
           (t.expiresAt ? `  expires=${t.expiresAt}` : "") +
           (t.label ? `  label=${t.label}` : "")
       );

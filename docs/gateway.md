@@ -53,6 +53,28 @@ Only a hash of each token is stored (`~/.config/lazygate/gateway/tokens.json`, m
 effect immediately on a running gateway. The `Authorization` header identifies you to lazygate and is
 **never forwarded** to upstream servers. A session id only works for the user who created it.
 
+## Web UI
+
+Open `http://127.0.0.1:8787/ui` and paste a token. It is a single page served by the gateway (no build
+step, no extra dependencies, strict CSP, nothing stored in cookies — the token lives in
+`sessionStorage` and is sent as a bearer header).
+
+| Tab | Who | What |
+|---|---|---|
+| My credentials | everyone | Save, replace or remove your own API keys for servers with `auth.scope: "user"`. Stored encrypted; values are never shown again. A key sent in an `X-Lazygate-Cred-…` header still wins. |
+| Activity | everyone (admins see all users) | Recent tool calls from the audit log |
+| Sessions | admin | Live sessions and the servers each has active |
+| Tokens | admin | Create (optionally `admin`, groups, expiry, label) and revoke tokens. The new token is shown once. |
+| Secrets | admin | Set or delete server-level secrets (names only are listed) |
+| Servers | admin | Edit a server's credential scope and templates, groups and auto-activate. Writes `servers.json` (previous file kept as `servers.json.bak-ui`) and applies immediately. |
+
+Create the first admin from the CLI: `lazygate token create --user you --admin`. The page can't revoke
+the token you're signed in with.
+
+Stored user credentials live in `gateway/vault.json`, encrypted with AES-256-GCM and bound to the
+user, server and field. The key is `LAZYGATE_VAULT_KEY` (base64, 32 bytes) or an auto-generated
+`gateway/vault.key` (0600). Back both up together; without the key stored credentials are unreadable.
+
 ## Credentials
 
 Each server says where its credentials come from, in `servers.json`:
@@ -87,7 +109,7 @@ Each server says where its credentials come from, in `servers.json`:
 
 - `auth.env` (stdio servers) and `auth.headers` (HTTP servers) are templates. `${cred:field}` is a user
   credential, `${secret:path}` is a server secret.
-- **User credentials** are sent as headers, one per field: `X-Lazygate-Cred-jira-token: …`. The server
+- **User credentials** are either saved in the web UI or sent as headers, one per field: `X-Lazygate-Cred-jira-token: …` (a header overrides a saved value). The server
   name is matched against your configured servers, so hyphenated names (`request-mcp`) work. If one is
   missing, `activate_server` fails with the exact header to add, and `discover_tools` shows
   `⚠ needs credentials`.
@@ -138,7 +160,8 @@ lazygate serve [--host 127.0.0.1] [--port 8787] [--config servers.json] [--skill
 
 ## What the POC does not do
 
-- No OIDC / corporate SSO, no TLS termination, no encrypted database for user credentials, no connect
-  pages or public OAuth callback.
+- No OIDC / corporate SSO, no TLS termination, no public OAuth callback. The UI can't run an OAuth
+  authorization for you yet (that still happens on the gateway host); the vault is a local encrypted file,
+  not a database.
 - Upstream processes are per session, not pooled across a user's sessions.
 - Per-user skills, containers for stdio servers, rate limits and metrics.

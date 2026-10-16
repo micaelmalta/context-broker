@@ -1,7 +1,7 @@
 // src/gateway/audit.ts
 // Append-only JSON-lines audit log. Records who called what — never arguments or results.
 
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { dirname } from "path";
 
 export interface AuditEvent {
@@ -19,6 +19,23 @@ export interface AuditEvent {
 export class AuditLog {
   constructor(private readonly path: string | null) {
     if (path) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  }
+
+  /** Most recent events first; optionally only one user's. Reads the whole file — fine for a POC. */
+  tail(limit: number, user?: string): Array<AuditEvent & { ts: string }> {
+    if (!this.path || !existsSync(this.path)) return [];
+    const out: Array<AuditEvent & { ts: string }> = [];
+    const lines = readFileSync(this.path, "utf-8").split("\n");
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      if (!lines[i]) continue;
+      try {
+        const e = JSON.parse(lines[i]) as AuditEvent & { ts: string };
+        if (!user || e.user === user) out.push(e);
+      } catch {
+        /* skip a torn line */
+      }
+    }
+    return out;
   }
 
   record(e: AuditEvent): void {

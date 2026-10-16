@@ -19,11 +19,16 @@ import { CredentialResolver, SecretStore, canAccess, extractUserCreds, type User
 import { TokenStore, bearerToken, type UserIdentity } from "./tokens.js";
 import { AuditLog } from "./audit.js";
 import { Redactor } from "./redact.js";
+import { UserVault, mergeCreds } from "./vault.js";
+import { readBody, sendJson } from "./http-util.js";
+import { handleUi, isUiPath } from "./ui-api.js";
 
 export interface GatewayOptions {
   registry: Registry;
   tokens: TokenStore;
   secrets: SecretStore;
+  /** Per-user credentials entered in the web UI (encrypted). Optional. */
+  vault?: UserVault;
   audit: AuditLog;
   /** Default 127.0.0.1. Anything else is the caller's responsibility (TLS, firewall). */
   host?: string;
@@ -50,36 +55,18 @@ interface Session {
   manager: ProcessManager;
   server: Server;
   transport: StreamableHTTPServerTransport;
+  /** Credentials from the latest request headers (stored ones are merged in per request). */
   creds: UserCredentials;
   redactor: Redactor;
+  createdAt: number;
   lastSeen: number;
   closed: boolean;
-}
-
-const MAX_BODY_BYTES = 4 * 1024 * 1024;
-
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  if (res.headersSent) return;
-  res.writeHead(status, { "Content-Type": "application/json", ...headers });
-  res.end(JSON.stringify(body));
 }
 
 const rpcError = (status: number, code: number, message: string) => ({
   status,
   body: { jsonrpc: "2.0", error: { code, message }, id: null },
 });
-
-async function readBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += (chunk as Buffer).length;
-    if (size > MAX_BODY_BYTES) throw new Error("Request body too large");
-    chunks.push(chunk as Buffer);
-  }
-  const text = Buffer.concat(chunks).toString("utf-8");
-  return text ? JSON.parse(text) : undefined;
-}
 
 const firstText = (r: ToolResult): string => {
   const c = r.content[0] as { text?: unknown } | undefined;
@@ -94,6 +81,7 @@ export async function startGateway(opts: GatewayOptions): Promise<Gateway> {
   const maxPerUser = opts.maxSessionsPerUser ?? 10;
   const resolver = new CredentialResolver(secrets);
   const sessions = new Map<string, Session>();
+  const startedAt = Date.now();
 
   function closeSession(s: Session): void {
     if (s.closed) return;
@@ -107,7 +95,7 @@ export async function startGateway(opts: GatewayOptions): Promise<Gateway> {
     const redactor = new Redactor();
     const server = new Server({ name: APP_NAME, version: VERSION }, { capabilities: { tools: { listChanged: true } } });
 
-    const session = { user, server, creds, redactor, lastSeen: Date.now(), closed: false, id: "" } as Session;
+    const session = { user, server, creds, redactor, createdAt: Date.now(), lastSeen: Date.now(), closed: false, id: "" } as Session;
 
     session.manager = new ProcessManager({
       owner: user.id,
@@ -177,8 +165,9 @@ export async function startGateway(opts: GatewayOptions): Promise<Gateway> {
 
     // Auto-activate servers once the client finished initializing; skip anything that still needs credentials.
     server.oninitialized = () => {
-      for (const [name, cfg] of Object.entries(registry.serverConfigs)) {
-        if (!cfg.autoActivate || !canAccess(cfg, user)) continue;
+      for (const name of registry.router.listAll()) {
+        const cfg = registry.router.getConfig(name);
+        if (!cfg || !cfg.autoActivate || !canAccess(cfg, user)) continue;
         let runtime;
         try {
           runtime = access.prepare(name, cfg);
@@ -222,15 +211,40 @@ export async function startGateway(opts: GatewayOptions): Promise<Gateway> {
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const path = (req.url ?? "/").split("?")[0];
+    const [path, rawQuery = ""] = (req.url ?? "/").split("?");
 
     if (path === "/healthz") {
       res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
       return;
     }
-    if (path !== "/mcp") return sendJson(res, 404, { error: "not found" });
+    if (path !== "/mcp" && !isUiPath(path)) return sendJson(res, 404, { error: "not found" });
 
     if (!hostAllowed(req)) return sendJson(res, 403, { error: "host not allowed" });
+
+    if (isUiPath(path)) {
+      return handleUi(
+        {
+          registry,
+          tokens,
+          secrets,
+          vault: opts.vault,
+          audit,
+          startedAt,
+          sessions: () =>
+            [...sessions.values()].map((s) => ({
+              id: s.id,
+              user: s.user.id,
+              createdAt: s.createdAt,
+              lastSeen: s.lastSeen,
+              servers: s.manager.listActive(),
+            })),
+        },
+        req,
+        res,
+        path,
+        new URLSearchParams(rawQuery)
+      );
+    }
 
     const user = tokens.verify(bearerToken(req.headers.authorization));
     if (!user) {
@@ -247,7 +261,8 @@ export async function startGateway(opts: GatewayOptions): Promise<Gateway> {
       }
     }
 
-    const creds = extractUserCreds(req.headers, registry.router.listAll());
+    // Stored credentials (web UI) first, then whatever this request sent on top.
+    const creds = mergeCreds(opts.vault?.get(user.id) ?? new Map(), extractUserCreds(req.headers, registry.router.listAll()));
     const sid = req.headers["mcp-session-id"];
     const sessionId = Array.isArray(sid) ? sid[0] : sid;
 

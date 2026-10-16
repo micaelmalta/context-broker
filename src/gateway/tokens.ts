@@ -10,12 +10,15 @@ export interface UserIdentity {
   id: string;
   groups: string[];
   tokenId: string;
+  /** May manage tokens, secrets and servers in the web UI. */
+  admin: boolean;
 }
 
 interface StoredToken {
   user: string;
   groups: string[];
   hash: string;
+  admin?: boolean;
   label?: string;
   createdAt: string;
   expiresAt?: string;
@@ -60,7 +63,7 @@ export class TokenStore {
   }
 
   /** Returns the token — this is the only time it is available. */
-  create(opts: { user: string; groups?: string[]; expiresInMs?: number; label?: string }): { id: string; token: string } {
+  create(opts: { user: string; groups?: string[]; expiresInMs?: number; label?: string; admin?: boolean }): { id: string; token: string } {
     const data = this.load();
     const id = randomBytes(4).toString("hex");
     const secret = randomBytes(32).toString("base64url");
@@ -68,6 +71,7 @@ export class TokenStore {
       user: opts.user,
       groups: opts.groups ?? [],
       hash: sha256(secret),
+      admin: opts.admin || undefined,
       label: opts.label,
       createdAt: new Date().toISOString(),
       expiresAt: opts.expiresInMs ? new Date(Date.now() + opts.expiresInMs).toISOString() : undefined,
@@ -86,14 +90,15 @@ export class TokenStore {
     const b = Buffer.from(entry.hash, "hex");
     if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
     if (entry.expiresAt && Date.parse(entry.expiresAt) <= Date.now()) return null;
-    return { id: entry.user, groups: entry.groups, tokenId: m[1] };
+    return { id: entry.user, groups: entry.groups, tokenId: m[1], admin: entry.admin === true };
   }
 
-  list(): Array<{ id: string; user: string; groups: string[]; label?: string; createdAt: string; expiresAt?: string }> {
+  list(): Array<{ id: string; user: string; groups: string[]; admin: boolean; label?: string; createdAt: string; expiresAt?: string }> {
     return Object.entries(this.load().tokens).map(([id, t]) => ({
       id,
       user: t.user,
       groups: t.groups,
+      admin: t.admin === true,
       label: t.label,
       createdAt: t.createdAt,
       expiresAt: t.expiresAt,
