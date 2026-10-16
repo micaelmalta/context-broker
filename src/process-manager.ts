@@ -1,6 +1,7 @@
 // src/process-manager.ts
 // Manages lifecycle of child MCP server processes (stdio) and HTTP MCP servers
 
+import { createHash } from "crypto";
 import { spawn, ChildProcess } from "child_process";
 import { ServerConfig, OAuthConfig } from "./router.js";
 import { getAccessToken } from "./oauth.js";
@@ -168,6 +169,8 @@ export interface ActiveHttpServer {
   oauth?: OAuthConfig;
   /** True when the user supplied an Authorization header; we never replace it. */
   staticAuth: boolean;
+  /** Hash of the URL/headers/credentials this session was opened with. */
+  sig: string;
   toolTimeoutMs: number;
 }
 
@@ -185,6 +188,26 @@ export interface ProcessManagerOptions {
   reservedToolNames?: Iterable<string>;
   /** Called with a server's full tool list after activation and after every refresh. */
   onServerTools?: (serverName: string, tools: MCPTool[]) => void;
+  /**
+   * Gateway mode: the user this manager serves. OAuth tokens of servers with
+   * `auth.scope: "user"` are stored per owner instead of per server.
+   */
+  owner?: string;
+}
+
+/**
+ * Credentials resolved at runtime by the gateway (never read from servers.json).
+ * Merged after `${VAR}` expansion and never re-expanded, so a credential value that happens
+ * to contain `${…}` cannot pull in the gateway's own environment.
+ */
+export interface RuntimeCredentials {
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+}
+
+function hashOf(values: Record<string, string>): string {
+  const sorted = Object.fromEntries(Object.entries(values).sort(([a], [b]) => a.localeCompare(b)));
+  return createHash("sha256").update(JSON.stringify(sorted)).digest("hex");
 }
 
 function hasHeader(headers: Record<string, string>, name: string): boolean {
@@ -210,8 +233,10 @@ export class ProcessManager {
   private readonly onToolsChanged?: () => void;
   private readonly onServerTools?: (serverName: string, tools: MCPTool[]) => void;
   private readonly reserved: Set<string>;
+  private readonly owner?: string;
 
   constructor(opts: ProcessManagerOptions = {}) {
+    this.owner = opts.owner;
     this.onToolsChanged = opts.onToolsChanged;
     this.onServerTools = opts.onServerTools;
     this.reserved = new Set(opts.reservedToolNames ?? []);
@@ -234,34 +259,53 @@ export class ProcessManager {
   }
 
   /** Inputs that determine the stdio child process; any change requires a new spawn. */
-  private stdioSpawnSignature(config: ServerConfig): string {
+  private stdioSpawnSignature(config: ServerConfig, runtime?: RuntimeCredentials): string {
     return JSON.stringify({
       command: config.command ?? null,
       args: config.args ?? [],
       env: config.env ?? {},
       inheritEnv: config.inheritEnv ?? null,
+      // A changed credential means a fresh process (hashed so secrets never sit in a map key).
+      runtimeEnv: runtime?.env ? hashOf(runtime.env) : null,
     });
   }
 
-  activate(name: string, config: ServerConfig): Promise<MCPTool[]> {
+  /** Same for HTTP servers: a changed URL, header or credential means a fresh session. */
+  private httpSignature(config: ServerConfig, runtime?: RuntimeCredentials): string {
+    return JSON.stringify({
+      url: config.url ?? null,
+      headers: config.headers ?? {},
+      runtimeHeaders: runtime?.headers ? hashOf(runtime.headers) : null,
+    });
+  }
+
+  activate(name: string, config: ServerConfig, runtime?: RuntimeCredentials): Promise<MCPTool[]> {
     const inFlight = this.activating.get(name);
     if (inFlight) return inFlight;
 
-    const p = this.doActivate(name, config).finally(() => {
+    const p = this.doActivate(name, config, runtime).finally(() => {
       this.activating.delete(name);
     });
     this.activating.set(name, p);
     return p;
   }
 
-  private async doActivate(name: string, config: ServerConfig): Promise<MCPTool[]> {
+  private async doActivate(
+    name: string,
+    config: ServerConfig,
+    runtime?: RuntimeCredentials
+  ): Promise<MCPTool[]> {
     if (config.type === "http" || config.url) {
       const existing = this.activeHttp.get(name);
-      if (existing) return existing.tools;
-      return this.activateHttp(name, config);
+      const httpSig = this.httpSignature(config, runtime);
+      if (existing) {
+        if (existing.sig === httpSig) return existing.tools;
+        this.deactivate(name);
+      }
+      return this.activateHttp(name, config, runtime, httpSig);
     }
 
-    const sig = this.stdioSpawnSignature(config);
+    const sig = this.stdioSpawnSignature(config, runtime);
     const existingStdio = this.active.get(name);
     if (existingStdio) {
       if (existingStdio.spawnSig === sig) return existingStdio.tools;
@@ -275,7 +319,7 @@ export class ProcessManager {
 
     console.error(`${LOG_PREFIX} Activating server: ${name}`);
 
-    const env = this.resolveEnv(config.env ?? {}, name);
+    const env = { ...this.resolveEnv(config.env ?? {}, name), ...(runtime?.env ?? {}) };
     const child = spawn(config.command, config.args ?? [], {
       env: buildChildEnv(process.env, config.inheritEnv, env),
     }) as ChildProcess;
@@ -463,15 +507,22 @@ export class ProcessManager {
     url: string,
     headers: Record<string, string>,
     oauth: OAuthConfig | undefined,
-    force: boolean
+    force: boolean,
+    config: ServerConfig
   ): Promise<OAuthConfig> {
     const resolved = oauth ?? {};
-    const token = await getAccessToken(name, url, resolved, { force });
+    const owner = config.auth?.scope === "user" ? this.owner : undefined;
+    const token = await getAccessToken(name, url, resolved, { force, owner });
     headers["Authorization"] = `Bearer ${token}`;
     return resolved;
   }
 
-  private async activateHttp(name: string, config: ServerConfig): Promise<MCPTool[]> {
+  private async activateHttp(
+    name: string,
+    config: ServerConfig,
+    runtime: RuntimeCredentials | undefined,
+    sig: string
+  ): Promise<MCPTool[]> {
     const url = config.url!;
     const resolvedEnv = this.resolveEnv(config.env ?? {}, name);
     const headers: Record<string, string> = {
@@ -483,6 +534,8 @@ export class ProcessManager {
     for (const [k, v] of Object.entries(config.headers ?? {})) {
       headers[k] = this.expandVars(v, name, resolvedEnv);
     }
+    // Gateway credentials go in last and are never re-expanded.
+    Object.assign(headers, runtime?.headers ?? {});
 
     const staticAuth = hasHeader(headers, "authorization");
     const oauthAllowed = config.oauth !== false && !staticAuth;
@@ -490,7 +543,7 @@ export class ProcessManager {
 
     // Explicit `oauth` config → authenticate up front. Otherwise only on a 401.
     if (oauthAllowed && oauth !== undefined) {
-      oauth = await this.attachOAuth(name, url, headers, oauth, false);
+      oauth = await this.attachOAuth(name, url, headers, oauth, false, config);
     }
 
     let tools: MCPTool[];
@@ -499,7 +552,7 @@ export class ProcessManager {
     } catch (err) {
       if (err instanceof HttpStatusError && err.status === 401 && oauthAllowed) {
         console.error(`${LOG_PREFIX} ${name} returned 401 on activate — starting OAuth`);
-        oauth = await this.attachOAuth(name, url, headers, oauth, true);
+        oauth = await this.attachOAuth(name, url, headers, oauth, true, config);
         tools = await this.fetchToolsHttp(url, headers, name);
       } else {
         throw err;
@@ -516,6 +569,7 @@ export class ProcessManager {
       config,
       oauth,
       staticAuth,
+      sig,
       activatedAt: new Date(),
       nextId: 1,
       toolTimeoutMs: config.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS,
@@ -602,7 +656,8 @@ export class ProcessManager {
         server.url,
         server.headers,
         server.oauth ?? this.normalizeOAuthConfig(server.config.oauth),
-        true
+        true,
+        server.config
       );
       res = await send();
     }

@@ -76,6 +76,7 @@ previous config.
 | `inheritEnv` | environment passed to a stdio child — see below |
 | `toolTimeoutMs` | per-call `tools/call` timeout for stdio and HTTP. Default 5 minutes |
 | `autoActivate` | `false` (default): spawned on `activate_server` or auto-activation. `true`: spawned when lazygate starts, in the background after it has connected, so a slow server never delays startup. Use `true` for servers you reach every session; keep heavy ones (`docker build`, `npm install` on first launch) `false` |
+| `auth`, `groups` | gateway mode only — credential sources and access policy; see [gateway.md](gateway.md) |
 | `migratedFrom`, `disabledPlugins` | set by `migrate`; `revert` relies on them |
 
 **Environment inheritance.** By default a stdio child gets lazygate's full environment plus its own

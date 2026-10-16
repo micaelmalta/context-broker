@@ -40,6 +40,8 @@ export interface OAuthConfig {
 export interface GetAccessTokenOptions {
   /** Skip the cached access token (e.g. after the server answered 401). */
   force?: boolean;
+  /** Store/read the token for this user instead of the shared per-server token (gateway mode). */
+  owner?: string;
 }
 
 interface TokenSet {
@@ -75,8 +77,11 @@ function safeFileName(serverName: string): string {
   return serverName.replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
-function tokenPath(serverName: string): string {
-  return resolve(TOKEN_DIR, `${safeFileName(serverName)}.json`);
+/** Tokens are shared per server, or per user when `owner` is set (gateway user-scope servers). */
+export function tokenPath(serverName: string, owner?: string, tokenDir: string = TOKEN_DIR): string {
+  return owner
+    ? resolve(tokenDir, "users", safeFileName(owner), `${safeFileName(serverName)}.json`)
+    : resolve(tokenDir, `${safeFileName(serverName)}.json`);
 }
 
 function clientPath(serverName: string): string {
@@ -112,12 +117,12 @@ function readJson<T>(path: string): T | null {
   }
 }
 
-function loadToken(serverName: string): TokenSet | null {
-  return readJson<TokenSet>(tokenPath(serverName));
+function loadToken(serverName: string, owner?: string): TokenSet | null {
+  return readJson<TokenSet>(tokenPath(serverName, owner));
 }
 
-function saveToken(serverName: string, token: TokenSet): void {
-  writePrivateJson(tokenPath(serverName), token);
+function saveToken(serverName: string, token: TokenSet, owner?: string): void {
+  writePrivateJson(tokenPath(serverName, owner), token);
 }
 
 function loadClient(serverName: string): StoredClient | null {
@@ -535,12 +540,13 @@ export function getAccessToken(
   config: OAuthConfig = {},
   opts: GetAccessTokenOptions = {}
 ): Promise<string> {
-  const existing = inFlight.get(serverName);
+  const key = `${opts.owner ?? ""}\u0000${serverName}`;
+  const existing = inFlight.get(key);
   if (existing) return existing;
   const p = obtainAccessToken(serverName, serverUrl, config, opts).finally(() => {
-    inFlight.delete(serverName);
+    inFlight.delete(key);
   });
-  inFlight.set(serverName, p);
+  inFlight.set(key, p);
   return p;
 }
 
@@ -552,7 +558,8 @@ async function obtainAccessToken(
 ): Promise<string> {
   const resource = canonicalResource(serverUrl);
 
-  let token = loadToken(serverName);
+  const owner = opts.owner;
+  let token = loadToken(serverName, owner);
   if (token?.resource && token.resource !== resource) {
     // Token was issued for a different server URL — never replay it here.
     console.error(`[oauth] Ignoring stored token for ${serverName}: issued for a different URL`);
@@ -560,7 +567,7 @@ async function obtainAccessToken(
   }
   if (token && !token.resource) {
     token.resource = resource; // adopt legacy token
-    saveToken(serverName, token);
+    saveToken(serverName, token, owner);
   }
 
   // Fast path: no network when the cached token is still good.
@@ -584,7 +591,7 @@ async function obtainAccessToken(
         token.refresh_token,
         resource
       );
-      saveToken(serverName, refreshed);
+      saveToken(serverName, refreshed, owner);
       return refreshed.access_token;
     } catch (err) {
       console.error(`[oauth] Refresh failed: ${(err as Error).message} — re-authorizing`);
@@ -639,7 +646,7 @@ async function obtainAccessToken(
       redirectUri,
       resource
     );
-    saveToken(serverName, fresh);
+    saveToken(serverName, fresh, owner);
 
     console.error(`[oauth] ${serverName} authorized successfully`);
     return fresh.access_token;

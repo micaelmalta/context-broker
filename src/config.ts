@@ -17,6 +17,15 @@ const OAuthSchema = z.union([
     .strict(),
 ]);
 
+const AuthSchema = z
+  .object({
+    scope: z.enum(["user", "server"]).optional(),
+    fallback: z.literal("server").optional(),
+    env: z.record(z.string()).optional(),
+    headers: z.record(z.string()).optional(),
+  })
+  .strict();
+
 const ServerSchema = z
   .object({
     description: z.string().default(""),
@@ -30,6 +39,8 @@ const ServerSchema = z
     oauth: OAuthSchema.optional(),
     autoActivate: z.boolean().default(false),
     inheritEnv: z.union([z.boolean(), z.array(z.string())]).optional(),
+    auth: AuthSchema.optional(),
+    groups: z.array(z.string()).optional(),
     toolTimeoutMs: z.number().int().positive().optional(),
     migratedFrom: z.string().optional(),
     disabledPlugins: z.array(z.string()).optional(),

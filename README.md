@@ -143,6 +143,20 @@ Details and limits (for example, project-scoped Claude servers are not migrated)
 
 ---
 
+## HTTP gateway (POC)
+
+`lazygate serve` shares one instance over Streamable HTTP, with a token per user, per-user credentials
+sent as headers (`X-Lazygate-Cred-<server>-<field>`), shared server secrets, and per-user OAuth tokens:
+
+```bash
+npx -y lazygate token create --user alice --groups eng   # shown once
+npx -y lazygate serve                                    # http://127.0.0.1:8787/mcp
+```
+
+See [docs/gateway.md](docs/gateway.md).
+
+---
+
 ## Development
 
 ```bash
