@@ -9,6 +9,20 @@ instead of configuring every MCP server locally. It keeps lazygate's core idea �
 meta-tools, servers activated on demand — and adds user identity, per-user and shared credentials,
 and per-user isolation for stdio servers. The existing stdio mode keeps working unchanged.
 
+## POC status (implemented in #19)
+
+A locally hosted POC covers a subset of this design, usage in [../gateway.md](../gateway.md):
+
+| Design area | POC |
+|---|---|
+| Inbound auth | Personal access tokens only (`lazygate token …`). OIDC is deferred. |
+| User credentials | Sent per request as `X-Lazygate-Cred-<server>-<field>` headers; nothing is stored for them. The encrypted store and connect pages (phases 4–5) are deferred. |
+| Server credentials | `secrets.json` (0600) or `LAZYGATE_SECRET_*`, referenced as `${secret:path}`. |
+| Per-user OAuth | Tokens stored per user and server; the authorization flow still uses the loopback callback. |
+| Sessions | One `ProcessManager` per MCP session. No cross-session upstream pooling yet. |
+| Policy, audit, redaction | `groups`, JSON-lines audit log, and redaction of credential values are in. |
+| Transport security | Loopback only, Host/Origin checks. TLS and `--allow-remote` hardening are left to a proxy. |
+
 ## Goals
 
 - One gateway URL per team; clients (Claude Code, Cursor, OpenCode) connect over Streamable HTTP.
